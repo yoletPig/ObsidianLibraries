@@ -4,11 +4,11 @@
     "type": "split",
     "children": [
       {
-        "id": "8074ca1941170304",
+        "id": "6c6f65ca95a21b0a",
         "type": "tabs",
         "children": [
           {
-            "id": "3b91b9341e66e74f",
+            "id": "ab7d2713e6e64757",
             "type": "leaf",
             "state": {
               "type": "empty",
@@ -89,7 +89,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "欢迎.md",
+                "file": "后融合.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -99,7 +99,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "欢迎 的反向链接列表"
+              "title": "后融合 的反向链接列表"
             }
           },
           {
@@ -158,9 +158,34 @@
       "command-palette:打开命令面板": false
     }
   },
-  "active": "4a313c7dc34299ac",
+  "active": "ab7d2713e6e64757",
   "lastOpenFiles": [
-    "点云",
+    "VLM & VLA/Stage 10-VLA 与具身智能/学习计划.md",
+    "VLM & VLA/Stage 9-Multimodal Agent 规划、工具调用与闭环执行/学习计划.md",
+    "VLM & VLA/Stage 8-大模型与多模态训练系统及推理工程/学习计划.md",
+    "VLM & VLA/Stage 7-RLVR 与 Multimodal Reasoning/学习计划.md",
+    "VLM & VLA/Stage 6-Post-training 偏好对齐与 DPO 实战/学习计划.md",
+    "VLM & VLA/Stage 5-数据质量评价与高效筛选/学习计划.md",
+    "VLM & VLA/Stage 4-数据合成与数据工程/学习计划.md",
+    "VLM & VLA/Stage 3-VLM 评测体系与幻觉分析/学习计划.md",
+    "VLM & VLA/Stage 2-VLM 训练实践与 SFT 微调/学习计划.md",
+    "VLM & VLA/Stage 1-VLM 基础与架构深度拆解/学习计划.md",
+    "VLM & VLA/Stage 10-VLA 与具身智能",
+    "VLM & VLA/Stage 9-Multimodal Agent 规划、工具调用与闭环执行",
+    "VLM & VLA/Stage 8-大模型与多模态训练系统及推理工程",
+    "VLM & VLA/Stage 7-RLVR 与 Multimodal Reasoning",
+    "VLM & VLA/Stage 6-Post-training 偏好对齐与 DPO 实战",
+    "VLM & VLA/Stage 5-数据质量评价与高效筛选",
+    "VLM & VLA/Stage 4-数据合成与数据工程",
+    "点云/后融合.md",
+    "VLM & VLA/Stage 3-VLM 评测体系与幻觉分析",
+    "VLM & VLA/Stage 2-VLM 训练实践与 SFT 微调",
+    "VLM & VLA/未命名.md",
+    "VLM & VLA/Stage 1-VLM 基础与架构深度拆解",
+    "c++/类模板.md",
+    "未命名.canvas",
+    "2026-08-01.md",
+    "c++/函数模板.md",
     "欢迎.md",
     "README.md"
   ]
