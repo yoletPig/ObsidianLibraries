@@ -74,8 +74,8 @@ Embedding 层汇合的压倒性优势：**实现只需一次 `torch.cat`，且�
 | 步骤 | 模块 | 输出形状 | 说明 |
 | --- | --- | --- | --- |
 | 1 | ImageProcessor | $[3, 336, 336]$ | Resize 到固定分辨率 |
-| 2 | CLIP ViT-L/14 | $[577, 1152]$ | 含 [CLS] 共 577 Token |
-| 3 | 丢弃 [CLS]，取 Patch 序列 | $[576, 1152]$ | VLM 不用 [CLS] |
+| 2 | CLIP ViT-L/14 | $[577, 1024]$ | 含 [CLS] 共 577 Token |
+| 3 | 丢弃 [CLS]，取 Patch 序列 | $[576, 1024]$ | VLM 不用 [CLS] |
 | 4 | MLP Projector | $[576, 4096]$ | 对齐到 LLM (Vicuna/Qwen) 维度 |
 | 5 | Tokenizer 处理文本 | `input_ids: [L]` | `<image>` → ID 32000 |
 | 6 | Embedding 查表 | $[L, 4096]$ | 文本部分 |
@@ -146,7 +146,7 @@ $448 \times 448$ 的图：$1024$ Patch Token → **256 个 LLM Token**。这与 
 ```mermaid
 flowchart TB
     subgraph LLaVA["LLaVA-1.5 (固定 336×336)"]
-        A1["图片 336×336×3"] --> A2["CLIP ViT-L/14<br/>[576, 1152]"]
+        A1["图片 336×336×3"] --> A2["CLIP ViT-L/14<br/>[576, 1024]"]
         A2 --> A3["MLP Projector<br/>[576, 4096]"]
         A3 --> A4["插入 image_newline<br/>576+24=600 Token"]
         A5["文本 input_ids<br/>&lt;image&gt;→ID 32000"] --> A6["Embedding 查表<br/>[L, 4096]"]

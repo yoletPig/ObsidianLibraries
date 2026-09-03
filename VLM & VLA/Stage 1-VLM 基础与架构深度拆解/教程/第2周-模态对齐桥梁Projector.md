@@ -1,7 +1,7 @@
 # 第 2 周教程：模态对齐桥梁（Connectors / Projector）
 
 > **本周要回答的三个问题**
-> 1. 1152 维的视觉特征如何变成 LLM 能"读懂"的 4096 维 Embedding？一个两层 MLP 真的够吗？
+> 1. 1024 维的视觉特征（CLIP-L）如何变成 LLM 能"读懂"的 4096 维 Embedding？一个两层 MLP 真的够吗？
 > 2. Q-Former、Perceiver Resampler 为什么要压缩 Token？压缩比与信息保真如何取舍？
 > 3. 为什么 2023 年之后新出的 VLM 几乎清一色选了 MLP 路线？
 
@@ -13,7 +13,7 @@
 
 ### 1.1 根本矛盾
 
-视觉塔和 LLM 是**独立预训练**的两个模型：视觉塔的 $1152$ 维空间里编码的是"图像块的视觉相似性"（由对比学习塑造），LLM 的 $4096$ 维空间里编码的是"文本 Token 的分布规律"（由下一词预测塑造）。两个空间的几何结构没有任何先验对齐——同一个"狗"的概念，在视觉特征空间和文本 Embedding 空间中的坐标毫无关系。
+视觉塔和 LLM 是**独立预训练**的两个模型：视觉塔的 $1024$ 维空间（以 CLIP ViT-L 为例；SigLIP-SO400M 则为 1152）里编码的是"图像块的视觉相似性"（由对比学习塑造），LLM 的 $4096$ 维空间里编码的是"文本 Token 的分布规律"（由下一词预测塑造）。两个空间的几何结构没有任何先验对齐——同一个"狗"的概念，在视觉特征空间和文本 Embedding 空间中的坐标毫无关系。
 
 Bridge 模块要解决的是：**在不破坏两个预训练模型的前提下，学一个映射 $f$，把视觉特征变换到 LLM 的输入空间，使得 LLM 把这些"视觉 Token"当作普通文本 Token 一样参与注意力计算**。
 
@@ -258,8 +258,8 @@ if __name__ == "__main__":
 - **修复**：小尺度初始化（如 `nn.init.normal_(w, std=0.02)`）或对输出加 LayerNorm；LLaMA-Factory 等框架的默认配置已处理，自己手写训练循环时最容易踩坑。
 
 **失效 2：混用不同视觉塔维度到同一 Projector 权重**
-- **症状**：加载 LLaVA checkpoint 时报 `shape mismatch`（期望 1024 入实际 1152 入）。
-- **根因**：CLIP-L 的 $d_v = 1152$ 而 SigLIP-SO400M 的 $d_v = 1152$ 但 patch 数不同（576 vs 729），另一类（如 SigLIP-base $d_v = 768$）连维度都不同。Projector 权重与特定视觉塔**强绑定**。
+- **症状**：加载 LLaVA checkpoint 时报 `shape mismatch`（期望 1024 入实际 1152 入，或反之）。
+- **根因**：CLIP-L 的 $d_v = 1024$、SigLIP-SO400M 的 $d_v = 1152$，两者 patch 数也不同（576 vs 729）；而 SigLIP-base 的 $d_v = 768$ 又连维度都不同。Projector 权重与特定视觉塔**强绑定**。
 - **定位**：读 checkpoint 的 `config.json` 中 `vision_feature_layer` / `mm_projector_cfg`。
 - **修复**：换视觉塔必须重训 Projector；不存在"通用" Projector。
 
