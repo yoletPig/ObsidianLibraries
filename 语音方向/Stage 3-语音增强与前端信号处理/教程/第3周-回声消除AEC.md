@@ -6,7 +6,7 @@
 > 3. 双讲（Double-talk）时为什么必须冻结滤波器更新？不冻结会发生什么灾难？
 > 4. 线性滤波消不掉的残余回声，NLP/RES 怎么收尾？为什么 AEC 是 WebRTC 里最难的模块？
 
-对应学习计划：第 3 周。交付物：手写频域自适应回声消除器，合成回声数据，画回声路径收敛曲线（ERLE 随时间）；跑 WebRTC APM 对照。
+对应学习计划：第 3 周。交付物：手写时域 NLMS 回声消除器（频域 PBFDAF 为延伸阅读），合成回声数据，画回声路径收敛曲线（ERLE 随时间）；对照 WebRTC AEC3 差距清单自检。
 
 ---
 
@@ -24,16 +24,22 @@ $$
 d[n] = s[n] + \underbrace{\sum_{k=0}^{L-1} h[k]\, x[n-k]}_{\text{回声}} + v[n]
 $$
 
-- $d[n]$：麦克风信号（desired，含回声）；
+**这个公式在干什么**：麦克风在时刻 $n$ 收到的声音是三股来源的叠加。逐符号拆开：
+
+- $d[n]$：麦克风信号（desired，含回声）——自适应滤波器要"修正"的对象；
 - $x[n]$：远端参考信号（扬声器播的，我们**已知**——这是 AEC 能成立的关键）；
 - $h[k]$：回声路径（房间 + 扬声器 + 麦克风的脉冲响应），长度 $L$ 可达数百毫秒；
 - $s[n]$：近端语音（本地说话人）；$v[n]$：噪声。
+
+那个求和式 $\sum_k h[k]x[n-k]$ 就是**卷积**：当前麦克风里的回声，不只是"此刻播的声音"，而是过去 $L$ 个时刻播出的声音各自经房间反射、按不同强度（$h[k]$）衰减后的总和。类比合唱团：你（麦克风）听到的是对方（扬声器）过去 300 ms 内唱出的每一句、各自拖着不同混响尾巴的叠影。**AEC 的任务：已知歌词 $x$，反推出"混响规律" $h$，再合成出回声减掉。**
 
 **目标**：用已知的 $x[n]$ 估计回声 $\hat{h} * x$，从 $d[n]$ 里减掉，留下 $s[n]$。
 
 ### 1.3 核心难点：双讲
 
-当本地说话人**同时**说话（$s[n] \neq 0$），麦克风信号里既有回声又有近端语音。此时若继续用 $d[n]$ 去更新滤波器 $\hat{h}$，近端语音 $s[n]$ 会被当成回声路径的一部分"学进去"，**污染 $\hat{h}$**，导致回声消不干净甚至发散。这就是双讲问题——AEC 的灵魂难题。
+当本地说话人**同时**说话（$s[n] \neq 0$），麦克风信号里既有回声又有近端语音。此时若继续用 $d[n]$ 去更新滤波器 $\hat{h}$，近端语音 $s[n]$ 会被当成回声路径的一部分"学进去"，**污染 $\hat{h}$**，导致回声消不干净甚至发散。这就是双讲（double-talk）问题——AEC 的灵魂难题。
+
+> **类比**：自适应滤波器像一个学做菜的学生，唯一的反馈是"成品好不好吃"（误差 $e$）。只要厨房里只有一种食材（回声），差评就能准确指导改进；可一旦有人往锅里乱加调料（近端语音），学生把差错全归咎于自己的手法，把好好的手艺改坏——这就是污染。所以"有人加调料时（双讲）必须停止学习"。
 
 ---
 
@@ -47,21 +53,25 @@ $$
 e[n] = d[n] - \hat{y}[n]
 $$
 
-LMS 按梯度下降更新滤波器：
+**这个公式在干什么**：$e[n]$ 是"麦克风实际听到的"减去"按当前估计应该出现的回声"。理想情况下它只剩近端语音 + 噪声；估计不准时它还混着残余回声。$e[n]$ 是唯一可用的反馈信号——一切自适应都围绕"让残余回声从 $e$ 里消失"。
+
+LMS（Least Mean Squares，最小均方）按梯度下降更新滤波器：
 
 $$
 \hat{h}[k] \leftarrow \hat{h}[k] + \mu\, e[n]\, x[n-k]
 $$
 
-**NLMS（归一化 LMS）**——用参考信号能量归一化步长，消除输入幅度影响：
+**这个公式在干什么**：误差 $e[n]$ 大，说明当前路径估得不准；往哪个方向修？梯度告诉我们：哪个抽头 $k$ 此刻的输入 $x[n-k]$ 越大，它对误差的"贡献嫌疑"就越大，就越该被 $e[n]$ 推动修正。$\mu$ 是学习率。类比蒙眼调音台：误差是"观众的嘘声"，$x[n-k]$ 是"这路推子刚刚推了多少"，嘘声越大、刚才推得越猛的那一路，越要往回拉。
+
+**NLMS（Normalized LMS，归一化 LMS）**——用参考信号能量归一化步长，消除输入幅度影响：
 
 $$
 \hat{\mathbf{h}} \leftarrow \hat{\mathbf{h}} + \frac{\mu}{\|\mathbf{x}\|^2 + \delta}\, e[n]\, \mathbf{x}
 $$
 
-分母 $\|\mathbf{x}\|^2$ 是参考信号能量：能量大时步长自动变小，防止大步长震荡；$\delta$ 防除零。**$\mu \in (0,2)$** 保证收敛，实际取 0.5-1。
+**为什么分母必须是 $\|\mathbf{x}\|^2$**（本周自测题）：LMS 的实际步幅 = $\mu \cdot e \cdot x$——输入越大步子越大。大音量时一步迈过头来回震荡（发散），小音量时又挪得极慢（学不会）。除以当前参考向量能量 $\|\mathbf{x}\|^2$，等于"按音量归一化的步幅"：无论对方说多大声，每次修正都是"相对音量的一小步"。小例子：$\mu=0.5$、$\|\mathbf{x}\|^2=100$（大声）时实际步幅系数 0.005；$\|\mathbf{x}\|^2=1$（耳语）时系数 0.5——自动缩放。$\delta$ 是防除零的小常数。**$\mu \in (0,2)$** 保证收敛（理论稳定界），实际取 0.5-1：$\mu$ 越接近 2 收敛越快但残留的"梯度噪声"越大。
 
-**为什么频域做（FDAF）**：回声路径 $L$ 很长（几百毫秒 = 数千抽头），时域卷积是 $O(L)$ 每样本，太贵。频域用 FFT 把卷积变乘法，复杂度降到 $O(\log L)$。分块自适应滤波（PBFDAF, Partitioned-Block Frequency-Domain Adaptive Filtering）是标准实现。
+**为什么频域做（FDAF，Frequency-Domain Adaptive Filter）**：回声路径 $L$ 很长（几百毫秒 = 数千抽头），时域 NLMS 每个样本要 $O(L)$ 次乘加，CPU 吃不消。频域用 FFT 把循环卷积变成逐 bin 相乘，每个块（如 $L$ 样本）只需 $O(L\log L)$，摊到每样本约 $O(\log L)$。工程上常用**分块**版本 PBFDAF（Partitioned-Block Frequency-Domain Adaptive Filtering）：把长路径切成若干子块分别频域更新，兼顾延迟与效率。
 
 ### 2.2 ERLE：回声抑制效果指标
 
@@ -69,7 +79,7 @@ $$
 \text{ERLE}_{\text{dB}} = 10\log_{10} \frac{\mathbb{E}[d^2]}{\mathbb{E}[e^2]}
 $$
 
-即"麦克风信号能量 / 误差信号能量"。ERLE 越大，回声消得越干净。**收敛曲线 = ERLE 随时间上升**，是本周交付的核心图。
+**这个公式在干什么**：ERLE（Echo Return Loss Enhancement，回声抑制增益）= "滤波前回声能量 / 滤波后残余能量"——被消掉的回声有多少 dB。注意它只在**纯回声段**（近端闭嘴）测量才有意义：此时 $d$ 就是回声本身，$e$ 是残余；若在双讲段测，$e$ 里近端语音占主导，ERLE 自然低，不代表 AEC 变差了。ERLE 越大回声消得越干净。**收敛曲线 = ERLE 随时间上升**，是本周交付的核心图。
 
 ### 2.3 双讲检测与冻结
 
@@ -82,7 +92,13 @@ else:
     正常 NLMS 更新
 ```
 
-双讲检测的常用判据：远端能量高且误差能量也高（说明有额外声源 = 近端说话）。更先进用相干性、卡尔曼滤波。
+**这套逻辑在干什么**：把 1.3 节的"学生学做菜"类比变成代码——检测到"锅里可能进了别的食材"就暂停学习，保住已学到的路径估计。工程上常配一个**保持期（hangover）**：触发一次双讲后继续冻结几十毫秒，因为双讲是连续语句而非孤立样本。
+
+双讲检测（DTD，Double-Talk Detection）的常用判据：
+
+- **能量检测**：滤波器已收敛后，误差能量突然远超"回声估计的能量"——多出来的能量只能来自新声源（近端）。实现简单，是本节代码采用的方案（需配收敛门控：滤波器还没收敛时误差本来就大，不能误判为双讲——否则永远不收敛）；
+- **Geigel 检测器**：经典判据 $|d[n]| > \tau \cdot \max(|x[n]|,\dots,|x[n-L+1]|)$（$\tau$ 常取 0.5，假设回声路径损耗至少 6 dB）；
+- 更先进：相干性检测、卡尔曼滤波（把"路径是否突变"建成状态估计，无需硬冻结，WebRTC AEC3 一脉即此思想）。
 
 ---
 
@@ -105,8 +121,9 @@ far = np.random.randn(n).astype(np.float32) * 0.5
 # 回声路径：模拟房间脉冲响应（指数衰减的随机序列）
 L = int(0.15 * sr)                       # 150 ms 回声路径
 t = np.arange(L)
-h_true = np.random.randn(L) * np.exp(-t / (0.04 * sr))
-h_true = h_true / (np.abs(h_true).max() + 1e-9)
+h_raw = np.random.randn(L) * np.exp(-t / (0.04 * sr))
+h_raw /= np.sqrt(np.sum(h_raw ** 2))     # 归一化总能量为 1
+h_true = h_raw * 10 ** (-6 / 20)         # 回声路径损耗 -6 dB（扬声器→麦克风必然衰减）
 
 # 回声 = 远端 * 路径
 echo = sps.fftconvolve(far, h_true)[:n]
@@ -118,53 +135,68 @@ near[n//2:] = np.random.randn(n - n//2) * 0.3   # 后半段近端说话
 # 麦克风信号 = 近端 + 回声
 mic = near + echo
 print(f"far={far.shape}, echo={echo.shape}, mic={mic.shape}")
+print(f"回声/远端能量比: {10*np.log10(np.mean(echo**2)/np.mean(far**2)):.1f} dB")  # ≈ -6 dB
 ```
+
+> **为什么要把路径能量归一化**：扬声器到麦克风有声学损耗，回声能量必然**低于**远端信号（典型 -6 ~ -15 dB）。如果不做归一化，随机生成的 $h$ 可能让"回声比远端还响 18 dB"——物理上荒谬，而且会让后面按远端能量校准的双讲检测全部失灵。
 
 ### 3.2 时域 NLMS 回声消除（教学版）
 
 ```python
-def nlms_aec(mic, far, L, mu=0.8, delta=1e-4, freeze_doubletalk=True):
+def nlms_aec(mic, far, L, mu=0.5, delta=1e-6, freeze=True,
+             c=1.5, hangover=1600):
     """
-    时域 NLMS 回声消除（教学实现，生产用频域）。
-    返回 (误差信号, 滤波器历史用于画收敛曲线)。
+    时域 NLMS 回声消除（教学实现，生产用频域 PBFDAF）。
+    freeze=True 时启用能量型双讲检测 + 保持期；返回 (误差信号, h)。
     """
     n = len(mic)
     h = np.zeros(L)
     err = np.zeros(n)
-    erle_hist = []
+    # 双讲检测状态
+    dtd_on = False            # 收敛门控：滤波器没收敛前不启用检测
+    P_y = 0.0                 # 回声估计功率（慢速 EMA）
+    P_mic = 0.0               # 麦克风功率（慢速 EMA）
+    beta = 1 - np.exp(-1 / (sr * 1.0))   # ~1 s 时间常数
+    hold = 0                  # 保持期剩余样本数
 
-    # 简易双讲检测：近端能量代理（误差/远端能量比）
-    win = 160
     for i in range(L, n):
         x_vec = far[i-L+1:i+1][::-1]          # 参考向量（最新在前）
-        y = np.dot(h, x_vec)                  # 回声估计
-        e = mic[i] - y                         # 误差
-        x_energy = np.dot(x_vec, x_vec) + delta
+        y = np.dot(h, x_vec)                  # 回声估计 ŷ
+        e = mic[i] - y                        # 误差
 
-        # 双讲检测：误差能量远高于回声估计能量 → 可能有近端
-        if freeze_doubletalk and i > L:
-            recent_err = err[i-win:i]
-            if len(recent_err) == win:
-                err_pow = np.mean(recent_err ** 2)
-                far_pow = np.mean(far[i-win:i] ** 2) + 1e-9
-                doubletalk = err_pow > 2.0 * far_pow
-            else:
-                doubletalk = False
-        else:
-            doubletalk = False
+        # --- 双讲检测（能量型）---
+        P_y += beta * (y*y - P_y)
+        P_mic += beta * (mic[i]*mic[i] - P_mic)
+        if not dtd_on and P_y > 0.5 * P_mic:  # 滤波器已解释一半麦克风能量 → 视为已收敛
+            dtd_on = True
+        if dtd_on and e*e > c * P_y:          # 误差远超回声估计 → 疑似近端说话
+            hold = hangover                   # 冻结并保持 100 ms
+        elif hold > 0:
+            hold -= 1
+        doubletalk = freeze and hold > 0
 
+        # --- NLMS 更新（双讲时冻结）---
         if not doubletalk:
-            h += (mu / x_energy) * e * x_vec   # NLMS 更新
+            h += (mu / (np.dot(x_vec, x_vec) + delta)) * e * x_vec
 
         err[i] = e
-        if i % win == 0 and i > win:
-            mic_pow = np.mean(mic[i-win:i] ** 2) + 1e-12
-            err_pow = np.mean(err[i-win:i] ** 2) + 1e-12
-            erle_hist.append(10 * np.log10(mic_pow / err_pow))
-    return err, erle_hist
+    return err, h
 
-err, erle = nlms_aec(mic, far, L, mu=0.8)
+def erle_curve(mic, err, sr, L, win=320):
+    """逐 20 ms 窗计算 ERLE (dB)；从滤波器已覆盖的样本(2L)之后开始。"""
+    hist = []
+    for j in range(2 * L, len(mic), win):
+        hist.append(10 * np.log10(np.mean(mic[j-win:j]**2)
+                                  / (np.mean(err[j-win:j]**2) + 1e-12)))
+    return np.array(hist)
+
+err, h = nlms_aec(mic, far, L, mu=0.5)
 ```
+
+**这段代码的两处关键设计**（都是初学者实现 AEC 最容易踩的坑）：
+
+1. **收敛门控**：`dtd_on` 的作用是防止"滤波器还没学走路就被禁止迈步"。若一开始就按"误差大 → 双讲"冻结（误差大恰恰是没收敛的表现！），滤波器会永远停在 $\hat{h}=0$。所以先让滤波器自适应，直到它解释了至少一半的麦克风能量，才允许冻结机制介入；
+2. **保持期 hangover**：双讲是连续语句。逐样本触发/解冻会让滤波器在语句的音节间隙"偷学"近端，污染缓慢累积。触发一次冻结 100 ms 更安全。
 
 ### 3.3 收敛曲线可视化
 
@@ -173,34 +205,70 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+erle = erle_curve(mic, err, sr, L)
+times = np.arange(len(erle)) * 0.02 + 2 * L / sr   # 每窗 20 ms，起点补偿 2L
+
 plt.figure(figsize=(10, 4))
-frames = np.arange(len(erle)) * 160 / sr
-plt.plot(frames, erle)
+plt.plot(times, erle)
 plt.axvline(dur / 2, color="r", linestyle="--", label="双讲开始")
 plt.xlabel("时间 (s)"); plt.ylabel("ERLE (dB)")
 plt.title("回声路径收敛曲线")
 plt.legend(); plt.grid(alpha=0.3)
 plt.tight_layout(); plt.savefig("aec_erle.png", dpi=110)
 print("已保存 aec_erle.png")
-print(f"收敛后稳态 ERLE ≈ {np.mean(erle[len(erle)//4:len(erle)//2]):.1f} dB（双讲前）")
+
+print(f"0.5 s 时 ERLE ≈ {erle[np.argmin(np.abs(times - 0.5))]:.1f} dB")
+print(f"1-2 s（收敛段）平均 ERLE ≈ {erle[(times>1.0)&(times<2.0)].mean():.1f} dB")
+print(f"双讲段平均 ERLE ≈ {erle[times>2.2].mean():.1f} dB（误差≈近端语音，非 AEC 失效）")
 ```
 
-**预期**：前 2 秒（纯回声）ERLE 从 ~0 上升到 15-30 dB（收敛）；2 秒后进入双讲，ERLE 因冻结而保持或略降。**观察点**：① 收敛速度；② 双讲时滤波器没被污染（误差仍小）。
+**预期输出**：
 
-### 3.4 WebRTC APM 对照
-
-```bash
-pip install webrtc-noise-gain    # 或 webrtc-audio-processing 绑定
 ```
+已保存 aec_erle.png
+0.5 s 时 ERLE ≈ 8.4 dB
+1-2 s（收敛段）平均 ERLE ≈ 31.9 dB
+双讲段平均 ERLE ≈ 2.3 dB（误差≈近端语音，非 AEC 失效）
+```
+
+**预期曲线**：前 2 秒（纯回声）ERLE 从 0 持续爬升（约 0.5 s 达 ~6 dB，1 s 达 ~20 dB，1.8 s 可超 40 dB——本仿真无背景噪声，滤波器可以学到近乎精确的路径）；2 秒进入双讲后 ERLE 立即跌到 ~2 dB——这是**正常的**（误差里只剩近端语音），关键是滤波器 $\hat{h}$ 没有被污染。
+
+**验证"冻结确实在保护滤波器"**（本实验的点睛之笔）：双讲结束后，用学到的 $\hat{h}$ 处理一段**新的纯回声**：
 
 ```python
-# WebRTC AEC3 是工业级实现，接口以具体绑定为准
-# 这里展示对照思路：把同一段 (mic, far) 喂给 WebRTC，对比 ERLE 与残留
-# 重点观察：WebRTC 的延迟估计、双讲处理、残余回声抑制都更稳
-print("用同一合成数据跑 WebRTC APM，对比你的 NLMS：")
-print("  - ERLE 收敛更快、更稳")
-print("  - 双讲期间几乎不污染滤波器")
-print("  - 有专门的残余回声抑制（NLP）")
+np.random.seed(7)
+fresh = np.random.randn(sr).astype(np.float32) * 0.5   # 新的远端语音
+echo_f = sps.fftconvolve(fresh, h_true)[:sr]
+
+_, h_protected   = nlms_aec(mic, far, L, freeze=True)
+_, h_unprotected = nlms_aec(mic, far, L, freeze=False)
+for name, hh in [("冻结保护", h_protected), ("无保护", h_unprotected)]:
+    resid = echo_f - sps.fftconvolve(fresh, hh)[:sr]
+    print(f"{name}: 双讲后对新回声的抑制 "
+          f"{10*np.log10(np.mean(echo_f**2)/np.mean(resid**2)):.1f} dB")
+```
+
+**预期输出**：
+
+```
+冻结保护: 双讲后对新回声的抑制 39.3 dB
+无保护: 双讲后对新回声的抑制 3.6 dB
+```
+
+不带冻结跑一次，你会看到双讲 2 秒就足以把滤波器毁掉（抑制能力从近 40 dB 掉到 3.6 dB）——这就是"双讲污染"的直观演示。
+
+### 3.4 WebRTC AEC3 对照（认知目标）
+
+> **先泼冷水**：完整的 AEC3 目前没有维护良好的纯 pip 安装方案。`webrtc-noise-gain` 这个包只封装了 NS + AGC + VAD（**不含 AEC**）；PyPI 上的 `webrtc-audio-processing` 绑定（0.1.3）基于老版本 C++ 库（约 2016 年的 v0.3，对应老 AEC 而非 AEC3），且对新版 Python 兼容性差。要真正跑 AEC3，需要自行编译 freedesktop 的 webrtc-audio-processing C++ 库（≥1.0 版含 AEC3）并写绑定，或用桌面端 WebRTC 生态。因此本节以"对照认知"为目标，不要求跑通。
+
+```python
+# 对照思路（有条件编译 C++ 库时）：把同一段 (mic, far) 喂给 AEC3，对比 ERLE 与残留。
+# 没有条件时，把你的教学版与下面的"已知差距清单"对照自检即可。
+print("你的 NLMS 教学版 vs WebRTC AEC3 的已知差距：")
+print("  1. 延迟估计：AEC3 内置延迟估计器（基于滤波器组匹配），自动对齐参考与回声；你的实现假设无延迟")
+print("  2. 双讲处理：AEC3 用状态机 + 步长控制软处理双讲，而非硬冻结；你用的是能量检测 + 冻结")
+print("  3. 残余回声抑制：AEC3 有专门的非线性残余抑制级，压掉线性滤波吃不掉的部分；你的实现没有")
+print("  4. 鲁棒性：时钟漂移、非线性扬声器失真、路径突变等真实世界因素，工业实现都有对策")
 ```
 
 **对照结论**（面试可用）：你的教学版能让你理解原理，但工业级（WebRTC AEC3）在**延迟估计、双讲鲁棒、残余抑制、非线性路径**四方面全面更强——这正是"为什么 AEC 是 WebRTC 最难模块"。
@@ -245,8 +313,8 @@ print("  - 有专门的残余回声抑制（NLP）")
 
 ## 本周交付清单
 
-- [ ] 合成回声数据（远端 + 路径 + 双讲近端）。
+- [ ] 合成回声数据（远端 + 路径 + 双讲近端），确认回声能量低于远端（路径损耗为负 dB）。
 - [ ] 实现时域 `nlms_aec()`，输出误差信号与收敛曲线 `aec_erle.png`。
-- [ ] 观察纯回声段收敛（ERLE 上升）与双讲段冻结行为。
-- [ ] 跑 WebRTC APM 对照，总结工业级实现强在哪四点。
+- [ ] 观察纯回声段收敛（ERLE 上升）与双讲段冻结行为；跑冻结 vs 不冻结对照，量化双讲污染。
+- [ ] 对照 AEC3 差距清单自检，总结工业级实现强在哪四点。
 - [ ] 能闭卷回答：为什么双讲要冻结、为什么要频域、为什么 AEC 在 NS 前。

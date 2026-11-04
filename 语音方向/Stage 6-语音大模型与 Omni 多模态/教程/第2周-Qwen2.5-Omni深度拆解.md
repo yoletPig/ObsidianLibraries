@@ -30,6 +30,8 @@
 
 ### 2.1 分工
 
+**这个流程图在干什么**：它描述一条「先想后说」的流水线。所有输入先被各模态编码器变成 token 拼进一条序列，交给 Thinker 处理；Thinker 一边输出文本（给人看、可审计），一边把内部隐藏状态喂给 Talker（只管「怎么说」）；Talker 自回归地生成语音 token，最后由声码器还原成波形。
+
 $$
 \text{音频+视频+文本} \xrightarrow{\text{编码器组}} \text{Thinker（大 LM）} \to
 \begin{cases}
@@ -39,8 +41,8 @@ $$
 $$
 
 - **Thinker**：多模态理解与文本生成主体，继承 Qwen2.5 LM 骨干，负责「想清楚」；
-- **Talker**：较小的自回归模型，**消费 Thinker 的隐藏状态**（而不是文本 token！）生成语音 token；
-- **流式声码器**：把语音 token 实时合成 24 kHz 波形。
+- **Talker**：较小的自回归模型（双轨设计：同时消费自己的文本轨和语音轨），**直接接收 Thinker 的隐藏状态**（而不是文本 token！）生成语音 token（约 12.5 Hz，即每个 token 约 80 ms）；
+- **流式声码器**：用 Flow-Matching DiT 把语音 token 变成梅尔谱，再用改良的 BigVGAN 实时合成 **24 kHz** 波形。
 
 ### 2.2 为什么 Talker 吃隐藏状态而不是文本
 
@@ -67,28 +69,32 @@ $$
 
 ### 3.1 复习：Qwen2-VL 的 M-RoPE
 
-你在 VLM 阶段学过：M-RoPE（Multimodal RoPE）把 RoPE 的维度切成三份——**时间、高度、宽度**，各自独立旋转：
+**这个公式在干什么**：RoPE（旋转位置编码）的本意是「位置不同 → 注意力里的相对角度不同」。标准 RoPE 把序列位置 $p$ 编成一个角度 $p\theta$；M-RoPE（Multimodal RoPE，Qwen2-VL 提出）把角度从 1 个升级成 3 个——**时间、高度、宽度**各转各的：
 
 $$
-\text{RoPE}(q, p) = q \cdot e^{i p \theta}, \quad p = (p_t, p_h, p_w)
+\text{RoPE}(q, p) = q \cdot e^{i\,p\theta}, \quad p = (p_t, p_h, p_w)
 $$
+
+符号拆解：$q$ 是 query 向量的一个二维分量对（把它当复数看，乘 $e^{i p\theta}$ 就是旋转角 $p\theta$）；$\theta$ 是该维度对的基频；关键是位置从标量 $p$ 变成三元组 $p = (p_t, p_h, p_w)$——注意力头的不同维度对分别「看」时间、行、列位置。
 
 - 纯文本：三个分量相等（退化为标准 1D RoPE）；
 - 图像：时间分量相同，$(p_h, p_w)$ 编码 patch 的二维位置；
-- 视频：$p_t$ 按帧推进（采样为 2 fps），$(p_h, p_w)$ 编码帧内位置。
+- 视频：$p_t$ 按帧推进（Qwen2-VL 按 2 fps 采样），$(p_h, p_w)$ 编码帧内位置。
 
 **M-RoPE 的遗留问题**：视频有了时间轴，**音频没有**——Qwen2-VL 处理音频时只把它当普通序列，音频与视频在位置编码上互不知晓对方的时间位置。这对「视频里第 3 秒的爆炸声是什么」这类跨模态时间推理是致命的。
 
 ### 3.2 TMRoPE 的升级：给音频一个真实时间戳
 
-TMRoPE（Time-aligned Multimodal RoPE，时间对齐多模态旋转位置编码）的做法：**音频每个 token 的时间分量 $p_t$ 直接取自它的物理时间戳**，与视频帧的时间戳共用同一时间轴：
+TMRoPE（Time-aligned Multimodal RoPE，时间对齐多模态旋转位置编码）的做法：**音频每个 token 的时间分量 $p_t$ 直接取自它的物理时间戳**，与视频帧的时间戳共用同一时间轴，且统一规定「**1 个时间 ID 对应 40 ms**」：
 
 $$
-p_t^{\text{audio}}(k) = \lfloor t_k \cdot f_{\text{rope}} \rfloor, \qquad
-p_t^{\text{video}}(j) = \lfloor \tau_j \cdot f_{\text{rope}} \rfloor
+p_t^{\text{audio}}(k) = \left\lfloor \frac{t_k}{40\,\text{ms}} \right\rfloor, \qquad
+p_t^{\text{video}}(j) = \left\lfloor \frac{\tau_j}{40\,\text{ms}} \right\rfloor
 $$
 
-其中 $t_k$ 是第 $k$ 个音频 token 的时刻、$\tau_j$ 是第 $j$ 帧的时刻、$f_{\text{rope}}$ 是统一的时间频率刻度。于是「同一物理时刻的音频和视频帧拿到相同/相邻的 $p_t$」——模型通过位置编码就能知道哪段声音对应哪几帧画面，无需显式对齐监督。
+**这个公式在干什么**：把「物理时刻」换算成「时间 ID」。$t_k$ 是第 $k$ 个音频 token 覆盖的时刻（音频塔输出恰好是 40 ms/帧，所以音频 token 的时间 ID 就是自然序号 $k$）；$\tau_j$ 是第 $j$ 个视频帧的时刻（视频是动态帧率，比如 2 fps 时相邻帧差 0.5 s，中间的时间 ID 就跳号）；分母 40 ms 是全模型统一的时间刻度。结果是：**同一物理时刻的音频和视频帧拿到相同/成比例的 $p_t$**——「视频里第 3 秒的爆炸声对应哪几帧画面」这个问题，被直接编码进了位置编码，所有注意力层、所有头都能免费使用，而不用靠数据去学。
+
+工程实现上还有两个配套细节（论文原文）：① 音视频表征按实际时间**每 2 秒切成一个 chunk 交错排列**（每个 chunk 内视觉在前、音频在后），保证序列局部性；② 音频编码器的注意力从「整段全注意力」改成**按 2 秒分块**，以支持流式输入。
 
 ### 3.3 一句话总结继承关系
 
@@ -103,18 +109,23 @@ $$
 ### 4.1 三轨并行
 
 ```
-输入轨：  音频分块(20ms×N) ─→ 音频编码器 ─→ Thinker 增量前向
-          视频帧(2 fps)   ─→ ViT ────────↗
+输入轨：  音频块(2 秒注意力块，每帧 40ms) ─→ 音频编码器 ─→ Thinker 增量前向
+          视频帧(动态帧率采样)          ─→ ViT ────────↗
+          （音视频按实际时间每 2 秒一个 chunk 交错喂入，chunk 内视觉在前、音频在后）
 Thinker轨：Thinker 逐块生成文本（边收边算）
-Talker轨： Talker 消费 Thinker 已产出的隐藏状态，流式生成语音 token
-输出轨：  流式声码器把语音 token 合成波形，边生成边播
+Talker轨： Talker 消费 Thinker 已产出的隐藏状态，流式生成语音 token（~12.5 Hz）
+输出轨：  流式声码器（Flow-Matching DiT + BigVGAN）把语音 token 合成 24 kHz 波形，边生成边播
 ```
 
 ### 4.2 首包延迟由什么决定
 
+**这个公式在干什么**：它把「用户说完话」到「用户听到第一个字」之间的每一级流水线延迟列队点名——优化首包延迟时，先知道钱花在哪一段。
+
 $$
 T_{\text{首包}} \approx T_{\text{音频缓冲}} + T_{\text{Thinker 首 token}} + T_{\text{Talker 首语音块}} + T_{\text{声码器首块}}
 $$
+
+四个符号依次是：① 凑齐第一块输入所需的缓冲时间（流式编码器要求按块喂入）；② Thinker 吐出第一个文本 token 的时间（prefill + 首步解码）；③ Talker 凑齐第一组语音 token 的时间（约 80 ms/token，一组若干 token）；④ 声码器合成并播出第一块波形的时间。任何一段变慢都直接抬高首包——这就是为什么 Talker 必须不等整句。
 
 关键工程点：Talker 不等整句文本，**Thinker 每产出一小段隐藏状态，Talker 就推进一次**。这与你 Stage 5 学的 CosyVoice chunk-aware 流式是同一个思想：**把「等整句」改成「等一个 chunk」**。
 
@@ -140,38 +151,41 @@ $$
 
 ### 6.1 TMRoPE 位置 ID 模拟（纯 Python，可运行）
 
+按论文设定，时间刻度为「1 个时间 ID = 40 ms」。模拟 2 fps 视频 + 25 Hz 音频 token 在同一时间轴上换算：
+
 ```python
-def tmrope_ids(video_timestamps, audio_timestamps, f_rope=2.0):
-    """为视频帧与音频 token 分配统一时间轴上的位置 ID。
+def tmrope_ids(video_timestamps, audio_timestamps, ms_per_id=40):
+    """为视频帧与音频 token 分配统一时间轴上的位置 ID（1 ID = 40 ms）。
     video_timestamps: 每帧的物理时刻(秒)；audio_timestamps: 每个音频 token 的时刻。
     """
     def to_id(ts):
-        return [int(round(t * f_rope)) for t in ts]
+        return [round(t * 1000 / ms_per_id) for t in ts]
     return to_id(video_timestamps), to_id(audio_timestamps)
 
-# 视频 2 fps（0, 0.5, 1.0, ... 秒），音频 token 每 40 ms 一个（25 Hz）
+# 视频 2 fps（0, 0.5, 1.0, ... 秒，动态帧率下的最简情形），音频 token 25 Hz（40 ms/帧）
 video_ts = [i * 0.5 for i in range(5)]            # 0 ~ 2.0 s
 audio_ts = [k * 0.04 for k in range(51)]          # 0 ~ 2.0 s
 
 v_ids, a_ids = tmrope_ids(video_ts, audio_ts)
-print("视频 p_t:", v_ids)
+print("视频 p_t:", v_ids)                          # [0, 12, 25, 38, 50] —— 帧间跳号
 
 # 验证：1.0 秒时刻，视频帧与音频 token 的时间 ID 对齐
 v_at_1s = v_ids[2]
 a_at_1s = a_ids[25]
 print(f"1.0s 处: 视频 p_t={v_at_1s}, 音频 p_t={a_at_1s}")
-assert v_at_1s == a_at_1s == 2, "同一物理时刻的音视频位置 ID 必须对齐"
+assert v_at_1s == a_at_1s == 25, "同一物理时刻的音视频位置 ID 必须对齐"
 # 音频时间 ID 单调不减（允许同 ID 重复，对应同一时间桶）
 assert all(a <= b for a, b in zip(a_ids, a_ids[1:])), "音频时间 ID 必须单调"
 print("TMRoPE 时间对齐验证通过 ✓")
 ```
 
-**预期输出**：1.0 s 处视频与音频的 $p_t$ 都是 2，断言通过。这就是「音频上了视频的时间轴」的最小可运行模型。
+**预期输出**：`1.0s 处: 视频 p_t=25, 音频 p_t=25`，断言通过。注意视频帧的 ID 序列是 `[0, 12, 25, 38, 50]`——2 fps 的帧间隔 0.5 s = 12.5 个 ID，帧间「跳号」正是 M-RoPE/TMRoPE 与 1D RoPE 的本质区别：跳号空隙里没有任何 token，但物理时间照样流逝。真实实现还会把音视频按 2 秒 chunk 交错排列，这里只演示时间刻度对齐。
 
 ### 6.2 云部署与三种交互模式（本周 MVP）
 
 ```bash
 pip install "transformers>=4.51" accelerate qwen-omni-utils soundfile
+# flash-attention 2 可选（需 bf16/fp16 GPU）：pip install -U flash-attn --no-build-isolation
 ```
 
 ```python
@@ -185,16 +199,17 @@ model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
 processor = Qwen2_5OmniProcessor.from_pretrained("Qwen/Qwen2.5-Omni-7B")
 
 def run(conversation, use_audio_in_video=True):
-    inputs = processor.apply_chat_template(
-        conversation, add_generation_prompt=True, tokenize=True,
-        return_tensors="pt", return_dict=True).to(model.device)
+    # 注意三处 use_audio_in_video 必须一致（apply_chat_template 的处理、processor、generate）
+    text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
     audios, images, videos = process_mm_info(conversation, use_audio_in_video=use_audio_in_video)
-    inputs = processor(audios=audios, images=images, videos=videos,
+    inputs = processor(text=text, audio=audios, images=images, videos=videos,
                        return_tensors="pt", padding=True,
-                       use_audio_in_video=use_audio_in_video).to(model.device)
-    text, audio = model.generate(**inputs, return_audio=True)
-    sf.write("reply.wav", audio[0].numpy(), samplerate=24000)
-    return text
+                       use_audio_in_video=use_audio_in_video)
+    inputs = inputs.to(model.device).to(model.dtype)
+    text_ids, audio = model.generate(**inputs, return_audio=True)  # speaker 默认 "Chelsie"，可选 "Ethan"
+    if audio is not None:
+        sf.write("reply.wav", audio.reshape(-1).float().detach().cpu().numpy(), samplerate=24000)
+    return processor.batch_decode(text_ids, skip_special_tokens=True)
 
 # 模式①：语音问答（输出文本+语音）
 conv_qa = [{"role": "user", "content": [
@@ -207,26 +222,29 @@ conv_av = [{"role": "user", "content": [
     {"type": "text",  "text": "视频里同时发生了什么画面和什么声音？"}]}]
 
 # 模式③：打断测试——流式生成中途插入新语音，观察输出是否中止并响应新指令
-# （用模型自带流式接口 stream_generate，边播边在第二轨喂入新音频块）
+# （自写推理循环：Talker 逐块生成 + 声码器逐块合成，边播边在输入轨喂入新音频块）
 ```
+
+> **显存提示**：Qwen2.5-Omni-7B 的「7B」指 Thinker 主干；全模型（Thinker + Talker + 音频/视觉编码器）约 **10.7B 参数**，BF16 权重约 21 GB——建议 24 GB 显存以上的卡；不够时可量化（GPTQ/AWQ，性能优化方向的知识）或用 CPU 卸载。仅要文本输出时用 `model.generate(**inputs, return_audio=False)`，可省去 Talker 的开销。
 
 **交付判据**：① 能听到语音回复且文本正确；② 对「画面与声音是否同步描述」抽查 5 条；③ 打断后 ≤1 s 内停止旧回复并开始响应。
 
 ### 6.3 Token 流全图（维度追踪法，本周交付）
 
-以 10 秒语音输入为例，沿链路标注形状（音频编码器为 Whisper 式：20 ms 帧移 → 50 Hz，两层卷积 2× 下采样 → 25 Hz）：
+以 10 秒语音输入为例，沿链路标注形状。音频编码器继承自 Qwen2-Audio：16 kHz 波形 → 128 通道梅尔谱（10 ms 步长）→ 卷积 stem 下采样到 50 Hz → **stride-2 池化**到 25 Hz（每帧对应 40 ms）：
 
 ```
 16 kHz 波形           : (160000,)                      # 10 s
-→ 梅尔/log-mel 特征    : (128, 500)                     # 50 Hz × 10 s
-→ 音频编码器 + 2×下采样 : (250, d_enc)                   # 25 Hz × 10 s
+→ 梅尔谱              : (128, 1000)                    # 10 ms 步长 × 10 s
+→ 卷积 stem（2 个 2× 卷积）: (1280, 500)                # 50 Hz × 10 s
+→ stride-2 池化        : (250, 1280)                    # 25 Hz × 10 s
 → Thinker 嵌入         : (250, d_model)                 # 与文本 token 拼成一条序列
 → Thinker 输出         : 文本 token 流 (L_text,) + 隐藏状态流 (L, d_model)
 → Talker               : 语音 token 流 (~12.5 Hz × 回复时长)
 → 流式声码器            : 24 kHz 波形块流
 ```
 
-**要点**：音频进 Thinker 是 25 Hz——10 秒占 250 个位置；对照第 1 周公式 $\text{token} = \text{时长} \times \text{帧率}$，30 秒语音就是 750 个 token，与文本共享同一上下文窗口。
+**要点**：音频进 Thinker 是 25 Hz——10 秒占 250 个位置；对照第 1 周公式 $\text{token 数} = \text{时长} \times \text{帧率} \div \text{降采样倍率}$（这里帧率 50 Hz、池化 2×），30 秒语音就是 750 个 token，与文本共享同一上下文窗口。这个 25 Hz 也和 TMRoPE 的「1 ID = 40 ms」严格一致——位置刻度和 token 帧率是同一套设计。
 
 ### 6.4 Thinker-Talker 分工的可运行模拟
 
@@ -272,7 +290,7 @@ print("Thinker-Talker 流式分工模拟 ✓（真实模型：Talker 自回归�
 
 - **双模型通信成本**：传隐藏状态比传文本贵（连续向量、每步都传），换来韵律保真与低延迟；若部署资源紧张，可退化为「文本转语音」模式（Talker 只吃文本），音质略降但带宽骤减。
 - **Thinker 大小**：7B 理解强但首包慢；端侧想抄这套架构必须砍 Thinker（这正是 Stage 7 用级联方案而不用 Omni 的原因之一）。
-- **时间对齐精度**：TMRoPE 的 $f_{\text{rope}}$ 越细对齐越准但位置 ID 越大、外推压力越大；2 fps 视频刻度是精度与外推的折中。
+- **时间对齐精度**：TMRoPE 统一为「1 时间 ID = 40 ms」——刻度越细对齐越准但位置 ID 越大、外推压力越大；40 ms 恰好与音频塔的 25 Hz 输出帧率对齐，是精度与外推的折中。视频按动态帧率采样，帧间跳号由真实时间戳决定。
 
 ### 7.2 失效模式
 

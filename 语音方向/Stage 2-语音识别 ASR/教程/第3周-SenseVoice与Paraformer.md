@@ -20,6 +20,8 @@ $$
 \mathcal{L}_{\text{CIF}} = \left(\sum_{t=1}^{T} w_t - U\right)^2
 $$
 
+**这个损失在干什么**：$\sum_t w_t$ 是全部帧权重加起来——直觉上就是"这一整句一共攒了多少个字的量"，也就是 CIF 的**软（可微）字数预测**。拿它和真实字数 $U$ 做平方差，等于逼着模型把每帧的"发射权重"调到总量刚好等于字数：字多的句子总权重大、字少的总权重小，模型由此学会"数数"。为什么是平方差而不是直接回归整数 $U$？因为 $\sum w_t$ 对每个 $w_t$ 都可导（平方差的梯度会分摊到每一帧的 $w_t$ 上，再反传回 Encoder），而"回归一个整数"不可导——这是连续化松弛的标准技巧。
+
 同时用"边界对齐"的交叉熵监督每个开火位置的输出字符。两个损失联合训练，让"长度预测"与"内容识别"同时收敛。
 
 2. **声学特征到字符的直接映射**：NAR 模型没有自回归语言建模兜底，因此更依赖**强声学编码**（Paraformer 用 SAN-M 自注意力 + 大词表中文子词）。这也是为什么 NAR 模型在**中文**这种字粒度语言上特别能打——每个字的信息量大、边界清晰。
@@ -28,15 +30,19 @@ $$
 
 ## 2. Paraformer 架构细节
 
+Paraformer 由阿里提出（[Gao et al., Interspeech 2022, arXiv:2206.08317](https://arxiv.org/abs/2206.08317)），是 NAR 路线在中文场景的代表实现。
+
 ### 2.1 结构组成
 
 $$
 \text{Fbank}(80) \xrightarrow{\text{Encoder (SAN-M)}} \xrightarrow{\text{Predictor (CIF)}} \text{开火位置} \xrightarrow{\text{Glancing 采样}} \xrightarrow{\text{Decoder}} \text{字序列}
 $$
 
-- **SAN-M Encoder**：Self-Attention with Non-autoregressive Memory，在标准自注意力外加入对历史上下文记忆的访问，增强长程建模；
-- **Predictor**：两层 FFN 输出每帧发射权重 $w_t$，CIF 积分定位开火点；
-- **Glancing Language Model 采样**：训练时随机把部分真实标签混入解码器输入（GLM 风格），弥合"训练看真实标签、推理看自己预测"的暴露偏差——这是 NAR 质量逼近 AR 的关键技巧。
+**这行数据流在干什么**：Fbank 特征先被编码成帧级表示；CIF 预测器（Predictor）从中算出"该输出几个字、每个字对应哪段帧"；Decoder 拿着这几个字级表示**并行**解码出全部文字——没有"上一个字"可以依赖，所以能一步出全句。
+
+- **SAN-M Encoder**（Self-Attention Network with Memory）：在标准自注意力外加入一个记忆项，让当前帧能额外访问前层输出的历史上下文，兼顾局部与长程建模；
+- **Predictor**：两层 FFN 输出每帧发射权重 $w_t$，CIF 积分定位开火点（机制见第 1 周 5.3 节）；
+- **Glancing Language Model 采样**：训练时按一定比例把部分**真实标签**混入解码器输入，并随训练逐步调整这个比例，弥合"训练时看真实标签、推理时只看声学特征"的暴露偏差——这是 NAR 质量逼近 AR 的关键技巧（源自 Glancing Transformer，Qian et al., 2021）。
 
 ### 2.2 与 CTC 的关系
 
@@ -48,31 +54,32 @@ Paraformer 可以看作"**连续化的 CTC**"：CTC 每帧硬选一个符号（�
 
 ### 3.1 设计定位
 
-SenseVoice 不是"更快的 ASR"，而是**语音理解大模型**：一个模型同时输出
+SenseVoice 是阿里 FunAudioLLM 团队 2024 年 7 月发布的语音理解模型（[论文 arXiv:2407.04051](https://arxiv.org/abs/2407.04051)）。它不是"更快的 ASR"，而是**语音理解大模型**：一个模型同时输出
 
-- 转写文字（中/英/日/韩/粤）；
-- 情感标签（`<|HAPPY|>`、`<|SAD|>`…）；
-- 音频事件（`<|BGM|>`、`<|Laughter|>`、`<|Applause|>`…）。
+- 转写文字（SenseVoice-Small 支持中/粤/英/日/韩 5 种语言；同系列的 SenseVoice-Large 覆盖 50+ 语言）；
+- 情感标签（`<|HAPPY|>`、`<|SAD|>`、`<|ANGRY|>`、`<|NEUTRAL|>`…）；
+- 音频事件（`<|BGM|>`、`<|Speech|>`、`<|Laughter|>`、`<|Applause|>`、`<|Cough|>`…）；
+- 逆文本正则化（ITN，数字/符号规范化）开关（`<|withitn|>` / `<|woitn|>`）。
 
-输出示例：
+输出示例（原始输出以 `<|...|>` 标签开头，这些标签不在转写正文里，做 CER 时要清洗）：
 
 ```
-<|zh|><|NEUTRAL|><|Speech|>今天天气不错，我们出去走走吧。
+<|zh|><|NEUTRAL|><|Speech|><|woitn|>今天天气不错，我们出去走走吧。
 ```
 
-### 3.2 为什么快 15 倍
+### 3.2 为什么快：三个因素 + 官方数字
 
 三个因素叠加：
 
-1. **非自回归主干**：一步并行解码（对比 Whisper 的逐字生成）；
+1. **非自回归主干**：一步并行解码（对比 Whisper 的逐字生成），这是数量级差距的主因；
 2. **更短的声学下采样**：更高的压缩率减少序列长度；
-3. **编码器-解码器规模精算**：SenseVoice-Small 的 Encoder 针对推理效率设计，无冗余层。
+3. **模型规模小**：SenseVoice-Small 约 234 M 参数，与 Whisper-small 同量级，却对标 Whisper-large 的精度。
 
-官方数据：SenseVoice-Small 在 A10 上 RTF 约 0.015（即处理 1 秒音频只要 15 毫秒），比 Whisper-large 快一个数量级以上。
+官方 README 宣称：**同参数量级下，推理速度比 Whisper-Small 快 5 倍以上、比 Whisper-Large 快约 15 倍**（这是官方测速环境下的对比数字，RTF 强依赖硬件与部署方式，请以你自己在第 4.2 节的实测为准）。
 
 ### 3.3 数据配方
 
-训练数据覆盖 40 万小时以上多语言音频，其中情感与事件标签由弱监督（分类模型预标注 + 清洗）获得——与你 VLM 阶段学过的"合成数据 + 执行验证"方法论同构。
+官方公布训练数据超过 **40 万小时**多语言音频，其中情感与事件标签由弱监督（分类模型预标注 + 清洗）获得——与你 VLM 阶段学过的"合成数据 + 执行验证"方法论同构。
 
 ---
 
@@ -117,21 +124,21 @@ for wav in sorted(glob.glob("test_set/*.wav"))[:20]:
 assert len(pairs) == 20, "请准备 20 条测试音频与对应文本"
 
 def normalize_zh(s: str) -> str:
-    """去标点、去空格、转小写——CER 前的标准清洗。"""
+    """去标点、去空格、去 <|...|> 标签、转小写——CER 前的标准清洗。"""
     import re
+    s = re.sub(r"<\|.*?\|>", "", s)          # SenseVoice 输出里的语言/情感/事件标签
     s = re.sub(r"[，。！？、,.!?\s\"'《》<>()\[\]]", "", s)
     return s.lower()
 
-def eval_model(model, pairs, use_hyp_key="text"):
+def eval_model(model, pairs):
     hyps, refs, rtf_list = [], [], []
     for wav, ref in pairs:
         t0 = time.time()
-        res = model.generate(input=wav)
+        res = model.generate(input=wav)       # res[0] 是 dict，含 "text" 等键
         dt = time.time() - t0
         audio_dur = len(sf.read(wav)[0]) / 16000
         rtf_list.append(dt / audio_dur)
-        hyp = res[0][use_hyp_key] if isinstance(res[0], dict) else res[0]["text"]
-        hyps.append(normalize_zh(hyp))
+        hyps.append(normalize_zh(res[0]["text"]))
         refs.append(normalize_zh(ref))
     return cer(refs, hyps), float(np.mean(rtf_list))
 
@@ -150,7 +157,7 @@ for name, (c, r) in results.items():
 3. **测试集平衡**：普通话、口音、中英混读、噪声各占比例，别全是干净朗读；
 4. **CER 而非 WER**：中文按字错误率（character），`jiwer.cer` 直接支持。
 
-**预期**：干净中文上三者 CER 都在 3-8% 区间，但 RTF 差异巨大——SenseVoice/Paraformer 约比 Whisper-large 快 10-20 倍。**把显存占用（`nvidia-smi` 或内存峰值）一并记录**，凑齐三维表。
+**预期**：干净中文上三者 CER 都在 3-8% 区间，但 RTF 差异明显——官方数据下 SenseVoice-Small 约比 Whisper-large 快 15 倍（你的实测倍数取决于 Whisper 用的尺寸与硬件，重点看**同机实测的相对比值**）。**把显存占用（`nvidia-smi` 或内存峰值）一并记录**，凑齐三维表。
 
 ### 4.4 热词（Hotword）机制
 
@@ -166,8 +173,7 @@ res = model_paraformer.generate(
 
 ```python
 model_ts = AutoModel(model="paraformer-zh")
-res = model_ts.generate(input="test_set/sample.wav",
-                        output_dir=None, return_raw_text=False)
+res = model_ts.generate(input="test_set/sample.wav")
 print(res[0]["timestamp"])   # [[start_ms, end_ms], ...] 每个字的时间区间
 ```
 

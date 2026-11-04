@@ -14,29 +14,33 @@
 
 ### 1.1 INT4 权重内存
 
-1.5B 参数 INT4（每参数 0.5 字节 + 分组量化的 scale 开销 ~10%）：
+**这个公式在干什么**：INT4 量化把每个参数从 fp16 的 2 字节压到 4 bit（0.5 字节），所以「参数个数 × 0.5 字节」就是权重的理论下界；但 Q4_K_M 这类分组量化还要为每组存 scale/zero-point 元数据，实测约多 10%——乘的 1.1 就是这笔「打包开销」。**手算小例**：$1.5 \times 10^9 \times 0.5 \times 1.1 = 0.83 \times 10^9$ 字节 ≈ 0.77 GiB ≈ **0.83 GB（十进制 GB）**。
 
 $$
 M_{\text{weight}} \approx 1.5 \times 10^9 \times 0.5 \times 1.1 \approx 0.83\,\text{GB}
 $$
 
-3B 则约 1.7 GB——都在 8 GB 板子的承受范围内，**真正的变量是 KV cache**。
+对照实际：Qwen2.5-1.5B-Instruct 的 **Q4_K_M GGUF 文件实测约 1.0 GB**（与第 1-2 周内存预算表那一行对上），比公式略大是因为嵌入层等部分保留更高精度；3B 理论估算约 1.7 GB（Q4_K_M 实测约 2 GB）——都在 8 GB 板子的承受范围内，**真正的变量是 KV cache**。
+
+> **动手验证**：把 `huggingface-cli download Qwen/Qwen2.5-1.5B-Instruct-GGUF` 下载的 `*q4_k_m.gguf` 文件 `ls -lh` 一下，和公式估算对账——权重内存是唯一「下载完就知道」的预算项，KV cache 才是要算的。
 
 ### 1.2 KV cache：每多一个上下文位置都要付费
 
-自回归生成时，每个历史 token 的 K/V 向量要缓存。Qwen2.5-1.5B 的结构参数（28 层、GQA 2 个 KV 头、head dim 128、fp16）：
+自回归生成时，每个历史 token 的 K/V 向量要缓存（类比：LLM 做「阅读理解」时给每个读过的字记一张便签，生成下一个字前要翻所有便签——便签必须全程留在桌上，即内存里）。Qwen2.5-1.5B 的结构参数（28 层、12 个 query 头、GQA 2 个 KV 头、head dim 128、fp16）：
 
 $$
 M_{\text{KV}} = 2 \times n_{\text{layer}} \times n_{\text{kv\_head}} \times d_{\text{head}} \times L \times 2\,\text{bytes}
 $$
 
-代入：每位置 $2 \times 28 \times 2 \times 128 \times 2 = 28\,672$ 字节 ≈ **28 KB/token**。这就是本周代码要验证的核心数字——上下文长度是被内存**反推**出来的：
+**这个公式在干什么**：算「给模型桌上留便签」要多少内存。逐项拆开：因子 **2** = K、V 各一份；$n_{\text{layer}}$ = 层数，每层注意力都有自己的便签；$n_{\text{kv\_head}} \times d_{\text{head}}$ = 每层每 token 的便签宽度（GQA 让多个 query 头共享一张便签，宽度由 KV 头数决定）；$L$ = 目前有多少个 token 在上下文里；乘 2 bytes 是 fp16。**它随 $L$ 线性增长**，权重是常数而 KV cache 不是——多轮对话、长历史都会持续加价，这就是历史必须截断的数学原因。结果拿来做什么：① 反推上下文上限；② 对账实测内存（本周 5.1 的计算器）。
+
+代入：每位置 $2 \times 28 \times 2 \times 128 \times 1 \times 2 = 28\,672$ 字节 ≈ **28 KB/token**。这就是本周代码要验证的核心数字——上下文长度是被内存**反推**出来的：
 
 $$
 L_{\max} = \frac{M_{\text{KV 预算}}}{28\,\text{KB}}
 $$
 
-给 KV cache 0.5 GB → $L_{\max} \approx 18000$，绰绰有余；但 4 GB 板子或 3B 模型（每位置 ~56 KB）时必须精算。
+**手算小例**：给 KV cache 0.5 GB → $L_{\max} = 512 \times 1024 \times 1024\,\text{B} / 28\,672\,\text{B} \approx 18\,700$，绰绰有余；但 4 GB 板子或 3B 模型（36 层，每位置 $2 \times 36 \times 2 \times 128 \times 2 = 36\,864$ ≈ 36 KB）时必须精算。
 
 ### 1.3 prefill 与首 token 延迟
 
@@ -54,7 +58,7 @@ $$
 | 路径 | 适用 | 说明 |
 | --- | --- | --- |
 | llama.cpp（GGUF INT4） | CPU 先行，立刻可用 | aarch64 编译成熟、NEON 加速、量化方案全（Q4_K_M 是质量甜点） |
-| rknn-llm | NPU 回填，性能优化方向联动 | 官方支持 Qwen2 系，需按其量化要求转模型 |
+| rknn-llm | NPU 回填，性能优化方向联动 | 官方示例覆盖 Qwen2/Qwen2.5 等主流开源 LLM，需按其量化要求转模型 |
 
 策略与 ASR 周相同：**llama.cpp 先打通，rknn-llm 后回填**，接口层封装成「文本进、文本流出」的黑盒。
 
@@ -63,9 +67,12 @@ $$
 ```bash
 # llama.cpp：转换 + 量化 + 编译后的板端运行
 llama-cli -m qwen2.5-1.5b-instruct-q4_k_m.gguf \
-    --ctx-size 4096 --threads 4 --affinity 0xF00 \   # 绑 4 个大核
-    -cnv                                                 # 会话模式
+    --ctx-size 4096 --threads 4 \
+    --cpu-mask 0xF0 \        # 绑 4 个大核：RK3588 上通常 cpu4-7 是 A76（掩码第 4~7 位）
+    -cnv                     # 会话模式
 ```
+
+> **核掩码怎么来的**：RK3588 是 8 核（cpu0-3 = A55 小核，cpu4-7 = A76 大核，不同板型设备树可能不同，用 `lscpu` 或 `cat /sys/devices/system/cpu/cpu4/cpufreq/cpuinfo_max_freq` 确认——A76 的最大频率明显更高）。`--cpu-mask` 接十六进制掩码，第 $n$ 位对应 cpu$n$：只开第 4~7 位 → `0b1111_0000` = `0xF0`。等价写法 `--cpu-range 4-7` 更不易写错。**为什么绑大核**：LLM 是全链路最重的负载，混跑在小核上吞吐直接掉一半以上；llama.cpp 也有 `--cpu-range`/`--cpu-strict` 可严格一线程一核。
 
 Python 侧用 `llama-cpp-python` 的流式接口消费文本流——LLM 每产出一段文本就喂给 TTS 切句，这是「想」与「说」并行的关键。
 
@@ -91,7 +98,7 @@ $$
 T_{\text{TTS 首包}} = T_{\text{等第一句}} + T_{\text{首句合成}} + T_{\text{播放缓冲}}
 $$
 
-三项都要压：等第一句靠 LLM 流式输出（别等整段）、首句合成靠小模型、播放缓冲 1~2 块（20~40 ms）。
+**这个公式在干什么**：把「预算表里 TTS ≤ 300 ms 那一格」拆成三个可分别下手的成本。逐项含义：$T_{\text{等第一句}}$ 是从 LLM 开始吐字到第一句文本凑齐的等待（由 LLM 的出字速度与第一句长度决定）；$T_{\text{首句合成}}$ 是小模型把第一句转成 PCM 的耗时；$T_{\text{播放缓冲}}$ 是攒够一小块音频才能送声卡的开销。**手算小例**：LLM 出「好的，」约 100 ms + 合成 100 ms + 缓冲 40 ms = 240 ms ≤ 300 ms——这就是为什么第一句允许只是半句、为什么播放缓冲只留 1~2 块（20~40 ms）。三项都要压：等第一句靠 LLM 流式输出（别等整段）、首句合成靠小模型、播放缓冲 1~2 块（20~40 ms）。
 
 ---
 
@@ -125,6 +132,8 @@ def kv_cache_bytes(n_layers, n_kv_heads, head_dim, ctx_len, bytes_per_elem=2):
     return 2 * n_layers * n_kv_heads * head_dim * ctx_len * bytes_per_elem
 
 # Qwen2.5-1.5B：28 层，GQA 2 KV 头，head dim 128，fp16
+# （出处：Qwen/Qwen2.5-1.5B-Instruct 的 config.json——num_hidden_layers=28、
+#   num_key_value_heads=2、num_attention_heads=12、head_dim=hidden_size/12=128）
 per_token = kv_cache_bytes(28, 2, 128, 1)
 print(f"1.5B 每位置 KV: {per_token} 字节 = {per_token/1024:.1f} KB")
 assert per_token == 28672, "Qwen2.5-1.5B 每位置应为 28 KB"
@@ -141,7 +150,7 @@ print(f"3B 每位置 KV: {per_token_3b/1024:.1f} KB")
 print("KV cache 预算验证通过 ✓")
 ```
 
-**预期输出**：28.0 KB/位置、0.5 GB 容纳 18724 位置、3B 约 36 KB/位置。**交付**：用你实际部署的模型结构参数重跑一遍，写进内存预算表。
+**预期输出**：28.0 KB/位置、0.5 GB 容纳 18724 位置、3B 约 36 KB/位置。**交付**：用你实际部署的模型结构参数重跑一遍，写进内存预算表；对账方法见第 7-8 周的长跑监控——注意 `llama.cpp` 还要算上计算缓冲与 mmap 映射，实测 RSS 会比纯 KV 估算高，对账口径是「KV 差额」而不是绝对值。
 
 ### 5.2 打断状态机（可运行、可测试）
 
@@ -150,7 +159,10 @@ import time
 from enum import Enum
 
 class State(Enum):
-    IDLE, LISTENING, THINKING, SPEAKING = range(4)
+    IDLE = 0
+    LISTENING = 1
+    THINKING = 2
+    SPEAKING = 3
 
 class DialogStateMachine:
     def __init__(self, vad_threshold_bargein=0.3, listen_timeout_s=30.0):
@@ -250,8 +262,11 @@ def split_sentences(text_stream_chunk: str, pending: str):
 # 打断回调：play_queue.clear(); tts.stop()
 
 sentences, tail = split_sentences("好的，今天天气晴", "")
+assert sentences == ["好的，"] and tail == "今天天气晴"   # 遇到第一个标点即切出半句
+# 跨 chunk 的残留继续拼：上一段尾巴 + 新 chunk，凑出后续完整句
 sentences2, tail2 = split_sentences("朗，适合出门。", tail)
-assert sentences == ["好的，"] and sentences2 == ["今天天气晴朗，适合出门。"]
+# 句末标点（。）后 split 会多出一个空残留，被 s.strip() 过滤后两句都视为完整
+assert sentences2 == ["今天天气晴朗，", "适合出门。"] and tail2 == ""
 print("分句逻辑验证通过 ✓")
 ```
 
@@ -268,7 +283,7 @@ print("分句逻辑验证通过 ✓")
 
 ### 6.2 失效模式
 
-1. **OOM 于长对话**：历史不截断，KV cache 线性膨胀。症状：第 6~8 轮崩溃；修复：4 轮滑窗 + 硬上限（4.1 节预算表），写入接口契约并加监控告警。
+1. **长对话失控**：历史不截断，每轮 prefill 输入线性变长——首 token 延迟随轮数明显上涨；超过 `--ctx-size` 后 llama.cpp 截断最旧上下文（答案「失忆」）或直接报错；KV cache 同步线性膨胀（虽以 ~28 KB/token 增速不快，但叠加计算缓冲与音频缓冲在 4 GB 板上仍可 OOM）。修复：4 轮滑窗 + 硬上限（4.1 节预算表），写入接口契约并加监控告警。
 2. **打断后残留语音**：播放队列清空了但音频驱动缓冲还有半秒数据。症状：喊「停」后还吐出半个词；修复：清空队列后调用声卡 `flush`，并把这 50 ms 算进打断预算。
 3. **唤醒后立即说话被截头**：唤醒词引擎切到 ASR 需要几十毫秒，用户紧接着说「今天天气」丢了「今」字。修复：唤醒触发时刻起持续录音缓冲，ASR 从缓冲区起点（而非就绪时刻）开始解码。
 4. **prefill 抖动**：同样问题有时 300 ms 有时 700 ms。根因：输入长度差异（历史轮数不同）+ 大核被抢占。修复：历史截断固定长度 + 绑核 + 埋点区分「输入长度」与「单位 token 耗时」两个变量。
@@ -278,7 +293,7 @@ print("分句逻辑验证通过 ✓")
 ## 7. 延伸思考题（含解析）
 
 **Q1**：为什么 KV cache 用 GQA（2 个 KV 头）能省内存？对端侧意味着什么？
-**A**：GQA 让多个 query 头共享一组 K/V，KV cache 与 KV 头数成正比——Qwen2.5 用 2 个 KV 头而非 28 个，KV 内存直接降到 1/14。对端侧：同等内存预算下上下文长 14 倍，这就是「端侧选模型先看 KV 结构」的原因。
+**A**：GQA 让多个 query 头共享一组 K/V，KV cache 与 KV 头数成正比——Qwen2.5-1.5B 用 2 个 KV 头服务 12 个 query 头，若无 GQA（12 个 KV 头）每位置 KV 需 $2 \times 28 \times 12 \times 128 \times 2 = 172\,\text{KB}$，GQA 直接把它降到 $1/6$（28 KB/token，4K 上下文时 KV 总量从 ~700 MB 降到 ~117 MB）。对端侧：同等内存预算下上下文长度扩大 6 倍，这就是「端侧选模型先看 KV 结构」的原因。
 
 **Q2**：TTS 为什么不能等 LLM 全部生成完再合成？两种延迟差多少？
 **A**：整句等待时用户沉默时间 = LLM 全部生成 + TTS 全句合成；流式时 ≈ 第一句生成 + 第一句合成。一句 50 字的回答，前者约 2~4 s，后者约 400~600 ms——差的就是「听助手开口」的生死线。代价是句间韵律可能不连贯（靠双缓冲与轻量拼接缓解）。

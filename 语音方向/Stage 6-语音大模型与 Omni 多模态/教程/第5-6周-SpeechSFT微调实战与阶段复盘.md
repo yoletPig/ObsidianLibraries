@@ -14,21 +14,25 @@
 
 ### 1.1 目标分布
 
-预训练的 Qwen2-Audio 学的是通用分布 $P_{\text{pre}}(\text{回答} \mid \text{音频}, \text{指令})$。Speech SFT 要把它搬到你的目标分布：
+**这个式子在干什么**：它把微调概括成一次「分布搬家」。预训练的 Qwen2-Audio 学的是通用分布 $P_{\text{pre}}(\text{回答} \mid \text{音频}, \text{指令})$——对任何音频、任何指令给「通用风格」的回答。Speech SFT 要把参数 $\theta$ 拉向你的目标分布：
 
 $$
 P_{\theta}(\text{回答} \mid \text{音频}, \text{指令}) \;\to\; P_{\text{target}}
 $$
 
+符号含义：$P_{\theta}$ 是当前模型给出回答的概率分布；$P_{\text{target}}$ 是你希望的条件分布（比如「听到开灯指令 → 回答“好的，已打开”」）。「拉」的实现方式就是对目标数据做极大似然（下面那条损失）。搬家幅度越小（目标越接近预训练分布），要的数据越少、遗忘越轻；搬家幅度越大，越要小心。
+
 目标分布越窄（比如只做「语音控制智能家居」），需要的数据越少、过拟合风险越高；越宽（通用语音助手），越需要真实数据多样性。
 
 ### 1.2 数据量级直觉
 
-损失函数就是标准的下一 token 交叉熵，只在回答部分算（指令与音频部分 mask 掉）：
+**这个公式在干什么**：它就是 SFT 的训练目标——标准的下一 token 交叉熵，**只在回答部分算**（指令与音频部分 mask 掉，不计损失）：
 
 $$
 \mathcal{L} = -\sum_{t \in \text{回答}} \log P_{\theta}(y_t \mid \text{音频}, \text{指令}, y_{<t})
 $$
+
+符号拆解：$y_t$ 是回答序列中第 $t$ 个文本 token；条件里 $\text{音频}$ 是音频塔+projector 给出的音频嵌入、$\text{指令}$ 是指令文本；$y_{<t}$ 表示回答前缀自回归地喂回来。求和只扫「回答」范围的 token——这就是「loss 只算 response」的含义：模型不必学着复述指令或转写音频（除非你想），只学「给什么回答」。
 
 经验量级：窄域任务 500~2000 条高质量三元组可见效（本周的 1000 条有出处）；风格/格式适配 200~500 条足够。你在 VLM Stage 4 合成数据阶段验证过同一规律——**数据质量 >> 数据数量**。
 
@@ -90,7 +94,9 @@ def build_text_pairs(llm_expand_fn, n=1000):
 from cosyvoice.cli.cosyvoice import CosyVoice2
 import soundfile as sf, torch, os
 
-model = CosyVoice2("CosyVoice2-0.5B")
+# model_dir 指向本地下载好的 CosyVoice2-0.5B 权重目录（含 cosyvoice.yaml 等）
+model = CosyVoice2("pretrained_models/CosyVoice2-0.5B")
+# 注意：CosyVoice2 输出 24 kHz；inference_zero_shot 的参考音频须为 16 kHz
 # 收集 5~10 段不同音色的参考音频（你的声音 + 公开多音色样本）
 PROMPTS = [("spk1.wav", "这是第一个说话人参考音频里说的话。"),
            ("spk2.wav", "这是第二个说话人参考音频里说的话。")]
@@ -113,7 +119,7 @@ def synthesize_pairs(text_pairs, out_dir):
     return manifest
 ```
 
-**真实录音侧**：同一批指令文本，由真人朗读/自然说出并录音（16 kHz），Stage 2 的 SenseVoice 反向校验转写一致（转写与文本不一致的样本剔除——这是数据清洗的最低要求）。
+**真实录音侧**：同一批指令文本，由真人朗读/自然说出并录音（16 kHz），Stage 2 的 SenseVoice 反向校验转写一致（转写与文本不一致的样本剔除——这是数据清洗的最低要求）。合成音频（CosyVoice2 输出 24 kHz）与真实录音在入库前**统一重采样到 16 kHz 单声道**，保证 manifest 里的声学分布一致——这正是 Stage 1 重采样知识的第一次实战复用。
 
 ### 2.4 合成数据的声学增广（缩小合成腔差距）
 
@@ -150,13 +156,13 @@ print("声学增广验证通过 ✓ —— 对 500 条合成音频各增广 1 �
 
 **用法**：增广只作用于**合成**那一半；真实录音保持原样（它本身就是分布锚点）。这是「用数据工程替代数据量」的标准手法——你 VLM Stage 4 的数据配方经验在这里第二次变现。
 
-### 2.4 ms-swift 数据格式
+### 2.5 ms-swift 数据格式
 
 ```jsonl
-{"messages": [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "<audio>帮我定一个早上八点的闹钟"}], "audios": ["/data/train/real_0001.wav"], "label": "response"}
+{"messages": [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "<audio>帮我定一个早上八点的闹钟"}, {"role": "assistant", "content": "好的，已为您设置好早上八点的闹钟。"}], "audios": ["/data/train/real_0001.wav"]}
 ```
 
-关键点：音频以 `<audio>` 占位 + `audios` 字段传入——占位符替换机制与你第 1 周学过的 `<image>` 替换完全同构。
+关键点：① 音频以 `<audio>` 占位 + `audios` 字段传入——占位符替换机制与你第 1 周学过的 `<image>` 替换完全同构；② **回答必须以 assistant 消息写在 messages 里**——SFT 的监督信号就是这条 assistant 回复（第 1.2 节公式的 $y_t$），不要另造 `label` 字段（`label` 在 ms-swift 中只用于 KTO 与分类任务）；③ ms-swift 的 `freeze_vit` 参数对音频模型同样生效——文档明确「vit 不只指 vision_tower，也包括 audio_tower」。
 
 ---
 
@@ -192,7 +198,7 @@ swift sft \
     --output_dir output/qwen2audio-speech-sft
 ```
 
-参数要点：`freeze_vit true` = 音频塔不动；`freeze_aligner false` = projector 全训；`lora_rank 16` 对千条级数据足够（你在 VLM 阶段验证过 rank 8~32 的差异不大）。
+参数要点：`freeze_vit true` = 音频塔不动（ms-swift 对多模态模型的 `vit` 泛指各模态编码器，音频模型的 audio_tower 也由它管辖）；`freeze_aligner false` = projector 全训；`target_modules all-linear` 时 LoRA 默认只挂在 LLM 侧组件上，正好符合本表策略；`lora_rank 16` 对千条级数据足够（你在 VLM 阶段验证过 rank 8~32 的差异不大）。具体 flag 名随 ms-swift 版本可能调整，跑之前先 `swift sft --help` 核对。
 
 ### 3.2 训练监控指标
 

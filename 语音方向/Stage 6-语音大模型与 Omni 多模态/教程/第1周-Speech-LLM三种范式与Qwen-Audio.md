@@ -45,11 +45,15 @@ $$
 
 ### 2.2 误差乘法
 
+**这个公式在干什么**：它量化级联范式最要命的短板——错误会**相乘传播**，而不是各自独立。级联链路上每多一个模块，端到端正确率就多乘一个小于 1 的数。
+
 设 ASR 整句正确率 $P_{\text{ASR}}$，LLM 在正确转写下的回答正确率 $P_{\text{LLM}}$。级联后端到端正确率（近似，假设 ASR 错误必然导致回答错误）：
 
 $$
 P_{\text{end2end}} \approx P_{\text{ASR}} \cdot P_{\text{LLM}}
 $$
+
+每个符号的物理含义：$P_{\text{ASR}}$ 是「转写文本没错」的概率；$P_{\text{LLM}}$ 是「拿到正确转写时答对」的概率；两者相乘 = 「转写对**且**答对」的概率。这个近似偏悲观（LLM 有语言先验，个别转写错误能靠上下文猜回来），所以它是**量级估计**而非精确值——第 8 节 Q1 会展开。
 
 数字感受：ASR 90%、LLM 80% → 端到端只剩 72%。**ASR 的 10% 错误是 LLM 永远无法修复的**——这就是误差传播天花板。特征注入范式让音频特征直接进 LLM，LLM 有机会「结合上下文猜回」ASR 会错的部分，联合训练还能反传梯度给编码器。
 
@@ -86,21 +90,25 @@ $$
 | LLaVA（你已学） | Speech-LLM 对应 | 备注 |
 | --- | --- | --- |
 | Vision Tower（CLIP ViT） | 音频塔（Whisper encoder / BEATs） | 都是冻结或弱微调的预训练编码器 |
-| 图像 → 576 个 patch token | 音频 → $T$ 帧特征（50 Hz × 秒数） | 音频是 1D 时序，长度随语音时长**无上限** |
+| 图像 → 576 个 patch token | 音频 → $T$ 帧特征（编码器帧率 × 秒数，Whisper 系为 50 Hz） | 音频是 1D 时序，长度随语音时长**无上限** |
 | MLP Projector $W \in \mathbb{R}^{d_{enc} \times d_{LLM}}$ | 同款 MLP，或 Q-Former | 把编码器空间映射进 LLM 嵌入空间 |
 | `<image>` 占位符替换为图像特征 | `<audio>` 占位符替换为音频特征 | 模板拼接逻辑完全一致 |
-| 图文对齐预训练（两阶段） | 音频-文本对齐预训练 | 第一阶段只训 Projector |
+| 图文对齐预训练（两阶段） | 音频-文本对齐预训练 | LLaVA 第一阶段只训 Projector；Qwen-Audio 例外：预训练阶段训音频塔、冻 LLM（见 3.2） |
 
 **差异点（面试必答）**：图像是二维、定长（固定分辨率 → 固定 576 token）；音频是一维时序，**帧率敏感**——30 秒音频按 50 Hz 就是 1500 token，直接塞进 LLM 上下文会爆炸。所以音频侧的 Projector 额外承担**降采样**职责（这是与视觉侧最大的工程差异）。
 
-### 3.2 Qwen-Audio：多任务音频塔 + 单层 cross-attention 采样
+### 3.2 Qwen-Audio：多任务音频塔 + 池化降采样
 
-Qwen-Audio（阿里，*Qwen-Audio: Advancing Universal Audio Understanding via Unified Large-Scale Audio-Language Models*，2023）的音频理解范围远超语音：语音、环境声、音乐都能问答。
+Qwen-Audio（阿里，*Qwen-Audio: Advancing Universal Audio Understanding via Unified Large-Scale Audio-Language Models*，arXiv:2311.07919，2023）的音频理解范围远超语音：语音、自然声、音乐、歌声共 30+ 种任务、8 种语言统一训练。
 
-- **音频塔**：Whisper-large-v2 的 encoder（约 640M），输出 50 Hz、1280 维特征；
-- **Projector**：单层 cross-attention（交叉注意力）采样器——用**可学习查询向量**对音频特征做注意力池化，把 1 秒 50 帧压到约 12.5 个 token（4 倍降采样）。这与 BLIP-2 的 Q-Former 思想同源，你在 VLM 阶段见过；
-- **多任务联合**：ASR、音频描述（AudioCaps）、声音事件分类（AudioSet）、音乐理解、语音情感识别，统一成「音频 + 任务指令 → 文本」格式联合训练；
-- **谱系**：Qwen-Audio → Qwen2-Audio（编码器不变，指令跟随更强，Stage 6 第 5-6 周微调就用它）。
+- **音频塔**：以 Whisper-large-v2 的 encoder 初始化（约 640M 参数），输入 16 kHz 波形 → 80 通道梅尔谱，卷积 stem 下采样后输出 **50 Hz、1280 维**特征（每 20 ms 一帧）；
+- **Projector（降采样靠池化）**：论文的做法非常朴素——在编码器输出后接一个 **stride = 2 的池化层（pooling）**，把相邻两帧拼/压成 1 帧，得到约 **25 Hz** 的音频表示（每帧约对应 40 ms 音频），再映射进 LLM 嵌入空间。**没有** cross-attention 采样器、没有 Q-Former——Qwen-Audio 用「最笨」的池化完成了降采样，把模型容量省给了 LLM；
+- **多任务联合**：ASR、语音翻译、方言识别、音频描述（AAC）、声音事件分类（AudioSet 系）、音乐问答、语音情感识别（SER）等，统一成「音频 + 任务指令 → 文本」格式联合训练；
+- **训练分两段**：多任务预训练阶段**冻结 LLM、只训音频塔**；SFT（Qwen-Audio-Chat）阶段反过来**冻结音频塔、只训 LLM**——与你 VLM 阶段「先训对齐层、再训 LLM」的两阶段思路互为镜像；
+- **谱系**：Qwen-Audio（Whisper-large-v2 塔）→ Qwen2-Audio（换用 Whisper-large-v3 塔，预训练配方改用自然语言 prompt，指令跟随更强，Stage 6 第 5-6 周微调就用它）。
+
+> **深入拆解：为什么「池化降采样」就够了？**
+> 音频 token 进 LLM 前必须压缩，压缩手段按「聪明程度」排序：cross-attention 采样（BLIP-2 Q-Former 式，可学习查询按内容挑选信息）> 池化/拼接（固定规则压缩）。Qwen-Audio 选后者，理由有三：① 参数最少，千小时级多任务预训练下不易过拟合；② 语音是均匀时序信号，信息密度沿时间轴相对平稳，均匀降采样的损失可控；③ 池化是纯张量操作，工程零风险。代价是时间分辨率减半——需要精确时间戳的任务会受损。面试时要能讲清「什么时候可以偷懒用池化、什么时候必须上 attention 采样」。
 
 ### 3.3 SALMONN：双编码器 + 窗口级 Q-Former
 
@@ -114,11 +122,15 @@ SALMONN（字节 + 清华，*SALMONN: Towards Generic Hearing Abilities for Larg
 
 ### 3.4 为什么必须降采样（定量）
 
+**这个公式在干什么**：它是音频 token 预算的一行速算器——拿到任何「音频进 LLM」的架构，先用它估出一条音频要吃掉多少上下文，再判断方案可不可行。
+
 $$
 \text{token 数} = \text{时长(s)} \times \text{帧率(Hz)} \div \text{降采样倍率}
 $$
 
-30 秒音频：50 Hz 不降采样 = 1500 token；4 倍降采样 = 375 token。LLM 上下文是稀缺资源（尤其端侧），且注意力计算 $O(L^2)$ 随序列长度平方增长——**音频 token 率是 Speech-LLM 的第一性能变量**。第 4 周的 codec 深挖会从生成侧再次撞上这个问题。
+符号含义：时长是音频秒数；帧率是编码器输出特征的时间密度（Whisper 系为 50 Hz，即每秒 50 帧）；降采样倍率是 projector 把多少帧压成 1 个 LLM token（Qwen-Audio 用 stride-2 池化即 2 倍，本节代码演示的 cross-attention 采样是 4 倍）。
+
+30 秒音频：50 Hz 不降采样 = 1500 token；2 倍降采样（Qwen-Audio 式）= 750 token；4 倍 = 375 token。LLM 上下文是稀缺资源（尤其端侧），且注意力计算 $O(L^2)$ 随序列长度平方增长——**音频 token 率是 Speech-LLM 的第一性能变量**。第 4 周的 codec 深挖会从生成侧再次撞上这个问题。
 
 ---
 
@@ -191,7 +203,8 @@ mlp_proj = nn.Sequential(nn.Linear(d_enc, d_llm), nn.GELU(), nn.Linear(d_llm, d_
 z_mlp = mlp_proj(audio_feats)
 assert z_mlp.shape == (B, T, d_llm)       # token 数不变：1500 个
 
-# ---- 方案二：cross-attention 采样器（Qwen-Audio 式，降采样 4×）----
+# ---- 方案二：cross-attention 采样器（BLIP-2/Q-Former 思想的 1D 版，降采样 4×）----
+# 注：Qwen-Audio 实际用更朴素的 stride-2 池化（2×）；本类演示"学习式压缩"的机制
 class AudioSampler(nn.Module):
     """每 4 帧音频用 1 个可学习查询做 cross-attention，输出 1 个 LLM token。"""
     def __init__(self, d_enc, d_llm, downsample=4):
@@ -218,7 +231,7 @@ print(f"MLP 方案: {z_mlp.shape[1]} token | 采样器方案: {z_s.shape[1]} tok
 print("两种 Projector 形状验证通过 ✓")
 ```
 
-**预期输出**：`MLP 方案: 1500 token | 采样器方案: 375 token`。对照第 3.1 节表格：方案一 = LLaVA 的 MLP 原样搬来；方案二 = Qwen-Audio 的 cross-attention 采样，**音频侧特有的降采样需求**就体现在这里。
+**预期输出**：`MLP 方案: 1500 token | 采样器方案: 375 token`。对照第 3.1 节表格：方案一 = LLaVA 的 MLP 原样搬来，token 数不减；方案二 = 可学习的 cross-attention 压缩（Q-Former 一族的核心机制），而 Qwen-Audio 的 stride-2 池化介于两者之间——**音频侧特有的降采样需求**就体现在这三档选择里。
 
 ### 6.3 上下文预算计算器（MVP 用）
 
@@ -260,7 +273,7 @@ print("延迟加法验证通过 ✓")
 ### 7.1 权衡
 
 - **级联的确定性**：ASR 输出可审计、可替换、出错可定位——产品级系统（尤其端侧）首选；特征注入是黑盒，错了不知道是编码器还是 LLM 的锅。
-- **降采样倍率**：压得越狠上下文越省，但细粒度时间信息（精确时间戳、快速连续指令）丢失越多。Qwen-Audio 的 4× 是理解任务的甜点；ASR 子任务要时间戳时必须保留更高分辨率。
+- **降采样倍率**：压得越狠上下文越省，但细粒度时间信息（精确时间戳、快速连续指令）丢失越多。Qwen-Audio 的 stride-2 池化（2×）是理解任务与实现复杂度的折中；ASR 子任务要时间戳时必须保留更高分辨率。
 - **单塔 vs 双塔**：SALMONN 双编码器能力覆盖广，但参数量、对齐复杂度翻倍；Qwen-Audio 单塔靠数据规模取胜。
 - **冻结音频塔与否**：冻结省显存、防灾难性遗忘；解冻（第二阶段轻微微调）能提升对齐精度——与 VLM 阶段 ViT 冻结策略的权衡一模一样。
 
@@ -281,8 +294,8 @@ print("延迟加法验证通过 ✓")
 **Q2**：为什么说音频塔与 Vision Tower 同构，但 Projector 不同构？
 **A**：同构在「冻结预训练编码器 + 可学习映射层 + 占位符替换」三件套；不同构在音频是 1D 时序、长度随时长无上限，Projector 必须兼任降采样（cross-attention 采样/池化），而图像固定分辨率下 token 数恒定，MLP 直投即可。
 
-**Q3**：Qwen-Audio 用单层 cross-attention 采样器而不用更深的 Q-Former，可能出于什么考虑？
-**A**：单层参数少、不易过拟合、梯度直达音频塔便于联合微调；且 4× 降采样的信息压缩任务并不复杂，深 Q-Former 的收益有限而训练成本翻倍。这与 BLIP-2 需要重 Q-Former 弥合「冻结 ViT 与冻结 LLM」的鸿沟不同——Qwen-Audio 的 LLM 侧训练更充分。
+**Q3**：Qwen-Audio 降采样只用 stride-2 池化，而不用 BLIP-2 那样的 Q-Former / cross-attention 采样器，可能出于什么考虑？
+**A**：① 池化零参数，30+ 任务的大规模多任务预训练下最不易过拟合，训练也最稳；② 语音信息沿时间轴相对均匀，固定规则压缩的损失可控，不需要「按内容挑重点」；③ BLIP-2 的重 Q-Former 是为了弥合「冻结 ViT 与冻结 LLM」的表示鸿沟，而 Qwen-Audio 预训练阶段会解冻音频塔联合训练，不需要额外的桥接模块。代价是时间分辨率减半——要精确时间戳的任务就得靠别的设计补。
 
 **Q4**：SALMONN 为什么需要 BEATs 这个第二编码器？只用 Whisper 不行吗？
 **A**：Whisper 在海量语音上训练，特征聚焦「说了什么」；环境声（狗叫、玻璃碎）、音乐结构等事件信息不在其分布内。BEATs 在 AudioSet 上自监督训练，补上非语音声音的表征。双塔拼接 = 能力并集。

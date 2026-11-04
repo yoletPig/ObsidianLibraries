@@ -26,7 +26,9 @@ $$
 \text{speaker}(句) = \arg\max_{spk} \; \text{overlap}(句, spk\text{ 的区间})
 $$
 
-即：哪个说话人的分离区间与这个句子的重叠时间最长，句子就归谁。
+**这个公式在干什么**：对每个候选说话人 $spk$，计算"句子时间区间与该说话人所有分离区间的重叠总时长"，把句子判给重叠最长的那个。$\text{overlap}([s,e], [a,b]) = \max(0, \min(e, b) - \max(s, a))$——两个区间的公共部分长度，不相交则为 0。
+
+**小例子**：句子时间 $[10.0, 13.0]$，分离输出两段：A 覆盖 $[9.5, 11.5]$，B 覆盖 $[11.5, 14.0]$。重叠时长：A = min(13, 11.5) − max(10, 9.5) = 1.5 s；B = 1.5 s——平票！此时可再参考边界约定（如"靠前优先"）或句中声纹，但多数情况下句子不会精确横跨换人点，投票总能分出胜负。
 
 **为什么用时间加权而非简单计数**：一句话可能跨两个分离段（如中途换人），按重叠时长加权比按段数计数更鲁棒。
 
@@ -41,7 +43,7 @@ $$
 五个组件：
 
 1. **前端**（Stage 3）：AEC+NS+AGC+VAD，产出干净语音；
-2. **ASR**（Stage 2）：SenseVoice/Paraformer，输出带时间戳的句子；
+2. **ASR**（Stage 2）：**Paraformer**（输出带时间戳的句子；注意 SenseVoiceSmall 本身**不输出时间戳**，若用它需配 VAD 切分来近似句级时间）；
 3. **分离**（Stage 4）：pyannote，输出说话人区间；
 4. **对齐**：时间加权投票，句子 ↔ 说话人；
 5. **声纹库**：把匿名的 "speaker_0" 映射到已知姓名（若有注册），否则保留 "Speaker X"。
@@ -105,7 +107,9 @@ class SpeakerRegistry:
         return None
 ```
 
-**生产升级**：底库上百万时用 **FAISS**（近似最近邻，ANN），把线性扫描换成毫秒级检索——这正是学习计划点名的技术。
+**生产升级**：底库上百万时用 **FAISS**（近似最近邻，ANN，如 IVF 粗筛 + PQ 量化精排），把线性扫描换成毫秒级检索——这正是学习计划点名的技术。
+
+> **注意**：`threshold=0.70` 只是 ECAPA 余弦相似度的经验起点，**不是常数**——它是第 2 周讲的"业务阈值"，必须按目标误识率在开发集上校准后才能上线。
 
 ### 3.3 完整会议转写系统
 
@@ -115,15 +119,20 @@ from pyannote.audio import Pipeline
 
 class MeetingTranscriber:
     def __init__(self, hf_token, registry=None):
-        self.asr = AutoModel(model="iic/SenseVoiceSmall")
+        # 选 Paraformer-large：它输出字/句级时间戳；
+        # SenseVoiceSmall 不输出时间戳，直接用它会导致对齐无米下锅。
+        self.asr = AutoModel(
+            model="iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+            vad_model="fsmn-vad",          # 长音频先切分
+            punc_model="ct-punc")          # 恢复标点
         self.diar = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
         self.registry = registry
 
     def transcribe(self, wav_path):
-        # 1. ASR（带时间戳）
-        asr_res = self.asr.generate(input=wav_path, output_timestamp=True)
-        sentences = self._parse_asr(asr_res)   # -> [{text, start, end}]
+        # 1. ASR（带时间戳，单位毫秒）
+        asr_res = self.asr.generate(input=wav_path, batch_size_s=300)
+        sentences = self._parse_asr(asr_res)   # -> [{text, start, end}（秒）]
 
         # 2. 分离
         diar = self.diar(wav_path)
@@ -143,9 +152,17 @@ class MeetingTranscriber:
         return tagged
 
     def _parse_asr(self, res):
-        # 把 FunASR 的时间戳输出解析成 [{text, start, end}]
-        # 具体字段以实际返回为准
-        return []
+        """把 FunASR 输出解析成 [{text, start, end}]（单位换算成秒）。
+        带 VAD 时句子级时间戳通常在 res[0]['sentence_info']，
+        字段以你安装的 funasr 版本实际返回为准，解析前先 print(res[0].keys())。"""
+        sentences = []
+        for sent in res[0].get("sentence_info", []):
+            sentences.append({
+                "text": sent["text"],
+                "start": sent["start"] / 1000.0,
+                "end": sent["end"] / 1000.0,
+            })
+        return sentences
 
     def _segment_embed(self, wav_path, start, end):
         # 抽取该句片段，用 ECAPA 提声纹（复用 Stage 4 第 1 周代码）
@@ -210,7 +227,7 @@ print(f"原始: {acc_raw:.2%}  前端增强后: {acc_enh:.2%}")
 声纹是**生物特征**，受《个人信息保护法》/ GDPR 严格约束：
 
 - **采集需明示同意**：注册声纹前必须获得授权；
-- **存储加密**：声纹向量加密存储，不可逆推原始语音；
+- **存储加密**：声纹向量加密存储、不落明文（声纹虽难以逆向重建原始语音，但同样属于生物特征敏感数据，泄露不可撤销）；
 - **注销权**：用户可要求删除其声纹；
 - **最小化**：只存必要数据，定期清理。
 

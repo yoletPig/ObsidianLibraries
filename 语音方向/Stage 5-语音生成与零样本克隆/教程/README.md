@@ -24,7 +24,7 @@ $$
 
 - Stage 1 的 Mel 特征知识（第 3 周）——TTS 的中间表示就是梅尔谱；
 - 云 GPU（预算已确认）用于微调；推理可在本地；
-- 依赖：`pip install cosyvoice f5-tts`（或按各仓库官方安装），`encodec`、`funasr`、`MFA`（强制对齐）。
+- 依赖：`f5-tts`、`encodec`、`funasr` 可直接 `pip install`；**CosyVoice 不在 PyPI 上**，需 clone 官方仓库（`FunAudioLLM/CosyVoice`）后按其 README 安装；MFA（Montreal Forced Aligner）推荐用 conda 安装。
 
 ## 与性能优化方向的联动
 

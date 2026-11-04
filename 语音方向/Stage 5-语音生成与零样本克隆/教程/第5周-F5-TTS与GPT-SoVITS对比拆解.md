@@ -13,33 +13,37 @@
 
 ### 1.1 设计哲学
 
-F5-TTS（"A Fairytaler that Fakes Fluent and Faithful Speech"）追求**极简**：
+F5-TTS（Chen et al., SWivid / 上海交通大学等，2024 年 10 月，论文 arXiv:2410.06885，*A Fairytaler that Fakes Fluent and Faithful Speech with Flow Matching*）追求**极简**：
 
 - **不用时长模型**（对比 FastSpeech）；
 - **不用音素**（对比几乎所有传统系统），直接用字符/文本；
-- **不用 phoneme alignment**。
+- **不用 phoneme alignment**（对比 FastSpeech 2 的 MFA）。
 
-它怎么做到的？答案是 **Flow Matching + 填充对齐**。
+它怎么做到的？答案是 **Flow Matching + 填充对齐**——这个思路来自 E2 TTS（MIT, arXiv:2406.18009），F5 的贡献是把 E2 的配方修得又快又好：ConvNeXt 文本编码器、DiT 骨干、Sway Sampling 推理加速。**模型规模**：Base 版 DiT 约 **336M** 参数，声码器用 **Vocos**，训练数据约 10 万小时（Emilia 数据集，中英为主）。
 
 ### 1.2 核心机制：填充（Padding）实现隐式对齐
 
 **问题**：文本序列短（如 5 个字符），目标语音长（如 200 帧梅尔谱）。两者长度不匹配，怎么对齐？
 
-**F5 的解法**：把文本序列**用空字符填充到与目标语音等长**，再让模型学习"文本字符在时间轴上的分布"：
+**F5（继承自 E2 TTS）的解法**：把文本序列**用填充符（filler token，E2 原文用 "mmm"）填到与目标语音等长**：
 
 $$
 \text{文本 "你好"} \;\to\; [\text{你}, \text{好}, \_, \_, \_, \dots] \;\text{（填充到 200 帧）}
 $$
 
-训练时，模型学习从"噪声 + 填充文本"还原出"正确分布的文本 + 语音"——**对齐隐式地由 flow matching 学到**，不需要显式时长预测器。
+**这个机制在干什么**：填充后"文本表示"与"语音表示"等长，可以逐帧拼在一起喂给模型。模型要学的任务变成了"**文本引导的语音填充**"（text-infilling）：已知 200 帧的文本占位图和（训练时）带噪的语音，还原干净的语音。哪个字符出现在哪些帧、占几帧，全部隐式地由 flow matching 网络自己"悟"出来——不需要显式时长预测器。**类比**：给模型一张打了码的填字板（文本是格子里的提示词），它自己决定每个提示"横跨几格"。
+
+**代价**：对齐完全交给模型，数字、专有名词这类"字符↔读音"不规则的内容容易读错（见 4.2 节失效模式）。
 
 ### 1.3 DiT 骨干
 
-F5 用 **DiT（Diffusion Transformer）** 作为去噪骨干——把 diffusion/flow 的 U-Net 换成 Transformer。Transformer 的全局注意力利于建模长程依赖（韵律）。
+F5 用 **DiT（Diffusion Transformer）** 作为去噪/流匹配骨干——把 diffusion/flow 常用的 U-Net 换成 Transformer。Transformer 的全局注意力利于建模长程依赖（韵律），且方便像 LLM 一样堆规模。
 
 ### 1.4 Sway Sampling 推理加速
 
-推理时沿 ODE 积分需要多步。F5 用 **Sway Sampling**——非均匀的步长调度，在轨迹早期用大步、后期用小步，**用更少步数达到同等质量**，推理加速显著。
+推理时沿 ODE 积分需要把 $t \in [0,1]$ 离散成若干步。F5 用 **Sway Sampling**——非均匀的步长调度：**把更多步数分配给轨迹的早期**（$t$ 小、还接近噪声的阶段），后期走大步。
+
+**为什么早期要多走几步**：ODE 早期是"决定整段语音的结构和内容"的阶段（相当于草稿定型），误差会被后面放大；后期只是"润色细节"，粗一点无妨。**类比**：画画先起稿精修（多步），最后铺背景色可以大笔一挥（少步）。这样**用更少步数（如 16–32 步）达到接近均匀采样的质量**——纯推理期技巧，不用重训模型。
 
 ---
 
@@ -47,22 +51,28 @@ F5 用 **DiT（Diffusion Transformer）** 作为去噪骨干——把 diffusion/
 
 ### 2.1 双模型架构
 
+GPT-SoVITS（作者 RVC-Boss，2024 年 2 月开源，GitHub: RVC-Boss/GPT-SoVITS）是两段式级联：
+
 $$
-\text{文本} \xrightarrow{\text{GPT (语言模型)}} \text{语义 token} \xrightarrow{\text{SoVITS (VITS 改造)}} \text{波形}
+\text{文本} \xrightarrow{\text{GPT (自回归 LM)}} \text{语义 token} \xrightarrow{\text{SoVITS (声学模型)}} \text{波形}
 $$
 
-- **GPT 部分**：自回归语言模型，把文本转成语义/离散 token，决定内容与韵律；
-- **SoVITS 部分**：基于 VITS 改造的模型，把语义 token 转成波形，注入参考音色。
+- **GPT 部分**：自回归语言模型，条件是 BERT 文本特征 + 参考音频的 **HuBERT 风格语义 token**（作为 in-context prompt），逐 token 生成目标语音的语义 token——决定内容与韵律；
+- **SoVITS 部分**：把语义 token 转成波形，同时以参考音频作为**声学 prompt**（参考特征注入模型）复刻音色。**注意**：它的音色注入靠"参考音频特征"而不是一个显式的说话人向量（speaker embedding）——这点与 CosyVoice 2 不同。
 
-**这个结构与 CosyVoice 的"LLM + flow"同构**——都是"语言模型出内容、声学模型出音色"，只是 SoVITS 用 VITS 而非 flow。
+**版本演进**（选型时要知道）：
+- **v1/v2**：SoVITS 部分基于 **VITS 改造**（GAN 训练）；v2 增加韩语、粤语支持；
+- **v3/v4**：SoVITS 声学模型改用 **CFM（flow matching）** 路线（参数量增至约 407M，声码器换 BigVGAN），零样本相似度显著提升；v4 修复了 v3 的金属音伪影并原生输出 48 kHz。
+
+**这个结构与 CosyVoice 的"LLM + flow"同构**——都是"语言模型出内容、声学模型出音色"；v3 之后的 GPT-SoVITS 连声学模型路线都收敛到 flow matching 了。
 
 ### 2.2 为什么少样本这么强
 
-GPT-SoVITS 的核心卖点：**1 分钟音频就能做少样本克隆，5 秒就能零样本**。原因：
+GPT-SoVITS 的核心卖点（官方 README 数据）：**5 秒音频就能零样本推理，1 分钟音频就能微调出高相似音色**。原因：
 
-1. **参考音频双用**：既做语义 prompt（GPT 的 in-context），又做音色参考（SoVITS 的 speaker embedding）；
-2. **数据标注工具链完善**：自带 ASR 转写、强制对齐、切片工具，5 分钟音频几秒就能处理成训练集；
-3. **少样本微调极快**：几十条数据微调几分钟就能显著贴合目标音色。
+1. **参考音频双用**：既做语义 prompt（GPT 的 in-context），又做音色参考（SoVITS 的声学 prompt）；
+2. **数据标注工具链完善**：WebUI 自带切片、降噪（UVR5）、ASR 转写（中文 Paraformer / 中英日 Faster Whisper）、校对，几分钟音频很快能处理成训练集；
+3. **少样本微调极快**：WebUI 里点两下就能分别微调 GPT 与 SoVITS 两个模块，低配 GPU 也能跑。
 
 ### 2.3 社区生态
 
@@ -104,10 +114,10 @@ test_texts = [
 import time
 
 models = {
-    "CosyVoice2": cosine_model,
+    "CosyVoice2": cosyvoice2_model,
     "F5-TTS": f5_model,
     "GPT-SoVITS": sovits_model,
-}
+}   # 各模型的加载与合成接口见各自仓库，synthesize() 为统一抽象
 
 results = {}
 for name, model in models.items():
@@ -201,7 +211,7 @@ plt.savefig("tts_radar.png", dpi=110)
 **A**：它用"文本填充到与语音等长 + flow matching"让模型隐式学习文本在时间轴的分布，对齐由 flow 自动学，不需要显式时长预测器。这是用生成模型的表达力换掉了对齐组件。
 
 **Q2**：GPT-SoVITS 的 GPT 和 SoVITS 各管什么？
-**A**：GPT（自回归 LM）从文本生成语义 token，决定内容与韵律；SoVITS（VITS 改造）把语义 token 转波形并注入参考音色。与 CosyVoice 的"LLM+flow"同构。
+**A**：GPT（自回归 LM）以 BERT 文本特征 + 参考音频 HuBERT 风格语义 token 为条件，生成目标语音的语义 token，决定内容与韵律；SoVITS 把语义 token 转波形，以参考音频作声学 prompt 复刻音色（v1/v2 基于 VITS，v3/v4 已改用 flow matching 路线）。与 CosyVoice 的"LLM+声学模型"同构。
 
 **Q3**：为什么 GPT-SoVITS 少样本这么强？
 **A**：参考音频双用（语义 prompt + 音色参考）、数据工具链完善（自动转写/对齐/切片）、少样本微调快。个人开发者 1 分钟音频就能微调出高贴合音色。

@@ -2,7 +2,7 @@
 
 > **本周要回答的四个问题**
 > 1. 一份 `{音频, 文本}` 的领域数据集，如何变成训练框架能吃的数据？音频列是怎么解码的？
-> 2. LoRA 微调 Whisper/SenseVoice 时，为什么冻结 encoder、只训 LoRA + projector？
+> 2. LoRA 微调 Whisper/SenseVoice 时，为什么冻结 encoder、只训低秩适配层？
 > 3. CER 怎么算？为什么必须逐条做 bad case 归因表而不只看平均值？
 > 4. 微调后"聋了"（通用能力退化）怎么发现、怎么防？
 
@@ -18,15 +18,14 @@
 
 ### 1.2 冻结策略的逻辑
 
-全量微调 7B 级声学模型：显存爆炸 + 灾难性遗忘。标准配方是**分层冻结**：
+全量微调大模型：显存爆炸 + 灾难性遗忘。标准配方是**分层冻结**。以 Whisper（encoder-decoder 结构）为例：
 
 | 组件 | 冻结? | 原因 |
 | --- | --- | --- |
 | Audio Encoder | ✅ 冻结 | 声学表征已足够通用，动了易遗忘、参数多 |
-| Projector / Adapter | ❌ 训练 | 模态对齐层小、最该适配目标域 |
-| LLM/Decoder（LoRA） | ❌ LoRA | 低秩适配语言分布，参数效率高 |
+| Decoder（LoRA） | ❌ LoRA | 低秩适配输出端的"语言分布"，参数效率高 |
 
-这与你在 VLM 阶段学的"冻结视觉塔 + 训 projector + LoRA LLM"完全同构——**多模态微调方法论是通用的**。
+这与你在 VLM 阶段学的"冻结视觉塔 + 训 projector + LoRA LLM"同构——Whisper 没有独立的 projector（encoder 输出直接进 decoder 的 cross-attention），所以少一层；SenseVoice/Paraformer 的微调用 FunASR 官方脚本（3.3 节），同样建议小学习率、少 epoch 防遗忘。**多模态微调方法论是通用的**。
 
 ### 1.3 LoRA 回顾（一句话）
 
@@ -38,18 +37,24 @@
 
 ### 2.1 数据格式
 
-主流框架（`ms-swift`、HF `datasets`）接受的典型格式：
+先统一维护一份最朴素的 jsonl（两个键：音频路径 + 文本），再按框架要求转换：
 
 ```json
 {"audio": "/data/train/0001.wav", "text": "瑞芯微的RK3588有6TOPS算力"}
 {"audio": "/data/train/0002.wav", "text": "今天把量化模型部署到昇腾910B"}
 ```
 
-要点：
+各框架的"包装"不同，别混用：
+
+- **HF `transformers`（Whisper 微调，3.1 节）**：就用上面这份，自己写 `Dataset.from_list` 加载；
+- **FunASR 官方微调（SenseVoice/Paraformer，3.3 节）**：jsonl，`source` 键放音频路径、`target` 键放文本，SenseVoice 还要加语言/情感/事件等前缀字段（官方示例见 [SenseVoice 仓库 `data/train_example.jsonl`](https://github.com/FunAudioLLM/SenseVoice/blob/main/data/train_example.jsonl)）；
+- **ms-swift（Qwen2-Audio/Qwen3-ASR 等音频大模型）**：messages + `audios` 格式，如 `{"messages": [{"role": "user", "content": "<audio>转写这段音频"}, {"role": "assistant", "content": "瑞芯微的RK3588有6TOPS算力"}], "audios": ["/data/train/0001.wav"]}`。注意 ms-swift 当前版本**不再直接支持微调 openai/whisper**，Whisper 请走 3.1 节的 transformers 路线。
+
+要点（所有框架通用）：
 
 - **音频采样率统一**到 16 kHz 单声道（用你的 `AudioPipeline` 预处理一遍）；
 - **文本是规范化后的转写**（去标点或与目标一致）；
-- **时长过滤**：去掉 < 0.5 s 或 > 30 s 的极端样本（噪声或超长）。
+- **时长过滤**：去掉 < 0.5 s 或 > 30 s 的极端样本（噪声或超长；Whisper 上限 30 秒）。
 
 ### 2.2 datasets 音频列的解码机制
 
@@ -80,44 +85,128 @@ print(type(sample["audio"]["array"]), sample["audio"]["sampling_rate"])
 
 ---
 
-## 3. 微调用例：ms-swift 一键流
+## 3. 微调用例：transformers + PEFT 微调 Whisper
 
-`ms-swift` 是阿里开源的多模态微调框架，统一了 ASR/VLM/TTS 的微调接口。以 Whisper LoRA 为例：
+微调 Whisper 的主流做法是 Hugging Face 官方路线：`WhisperProcessor` 处理特征、`Seq2SeqTrainer` 跑训练、`jiwer`/`evaluate` 算 WER，LoRA 用 `peft` 挂在 Decoder 的注意力层上（官方博客与 [HF 任务页](https://huggingface.co/blog/fine-tune-whisper) 的标准配方，以下为适配本教程数据格式的骨架）。
 
 ```bash
-# 安装
-pip install 'ms-swift[all]'
-
-# LoRA 微调（命令行示例，参数以官方最新文档为准）
-CUDA_VISIBLE_DEVICES=0 swift sft \
-    --model openai/whisper-small \
-    --train_type lora \
-    --dataset /path/to/asr_train.jsonl \
-    --num_train_epochs 3 \
-    --per_device_train_batch_size 8 \
-    --learning_rate 1e-4 \
-    --lora_rank 8 \
-    --lora_alpha 16 \
-    --freeze_encoder true \
-    --output_dir output/whisper-lora
+pip install "transformers" datasets evaluate jiwer accelerate peft soundfile
 ```
 
-**关键参数解读**：
+### 3.1 训练脚本骨架（云端 GPU 运行）
 
-- `--train_type lora`：启用 LoRA；
-- `--freeze_encoder true`：冻结声学编码器（第 1 节策略）；
-- `--lora_rank 8`：秩，8-16 常用；
-- `--learning_rate 1e-4`：LoRA 学习率通常比全量高一个量级。
+```python
+import torch, evaluate, re
+from datasets import Dataset, Audio
+from transformers import (WhisperProcessor, WhisperForConditionalGeneration,
+                          Seq2SeqTrainer, Seq2SeqTrainingArguments)
 
-### 3.1 训练观察
+MODEL = "openai/whisper-small"
+processor = WhisperProcessor.from_pretrained(MODEL, language="zh", task="transcribe")
+
+# ---- 数据：2.1 节的 jsonl ----
+import json
+rows = [json.loads(l) for l in open("/data/asr_train.jsonl")]
+ds = Dataset.from_list(rows).cast_column("audio", Audio(sampling_rate=16000))
+
+def prepare(batch):
+    audio = batch["audio"]
+    batch["input_features"] = processor(audio["array"],
+        sampling_rate=audio["sampling_rate"]).input_features[0]
+    batch["labels"] = processor.tokenizer(batch["text"]).input_ids
+    return batch
+
+ds = ds.map(prepare, remove_columns=ds.column_names)
+split = ds.train_test_split(test_size=0.1, seed=0)
+
+def collate(features):
+    import numpy as np
+    feats = [{"input_features": f["input_features"]} for f in features]
+    batch = processor.feature_extractor.pad(feats, return_tensors="pt")
+    labels = processor.tokenizer.pad(
+        {"input_ids": [f["labels"] for f in features]},
+        return_tensors="pt", padding=True)
+    batch["labels"] = labels["input_ids"].masked_fill(
+        labels["attention_mask"].ne(1), -100)   # padding 位置不计损失
+    return batch
+
+# ---- LoRA：只训 Decoder 注意力（q/v），冻结 Encoder ----
+# 注意用正则限定 decoder.*，否则 Encoder 里的 q/v 也会被挂上 LoRA
+from peft import LoraConfig, get_peft_model
+model = WhisperForConditionalGeneration.from_pretrained(MODEL)
+model.config.forced_decoder_ids = None
+model.generation_config.language = "zh"
+model.generation_config.task = "transcribe"
+lora_cfg = LoraConfig(r=8, lora_alpha=16, lora_dropout=0.05,
+                      target_modules=r"decoder\..*(q_proj|v_proj)")
+model = get_peft_model(model, lora_cfg)
+model.print_trainable_parameters()    # 观察：可训练参数只占总量的百分之几
+
+wer_metric = evaluate.load("wer")
+
+def compute_metrics(pred):
+    ids = pred.label_ids
+    ids[ids == -100] = processor.tokenizer.pad_token_id
+    pred_ids = pred.predictions
+    pred_str = processor.batch_decode(pred_ids, skip_special_tokens=True)
+    ref_str = processor.batch_decode(ids, skip_special_tokens=True)
+    norm = lambda s: re.sub(r"[，。！？、,.!?\s]", "", s)
+    return {"wer": wer_metric.compute(
+        references=[norm(s) for s in ref_str],
+        predictions=[norm(s) for s in pred_str])}
+
+args = Seq2SeqTrainingArguments(
+    output_dir="output/whisper-lora",
+    per_device_train_batch_size=8,
+    learning_rate=1e-3,          # LoRA 学习率比全量微调高 1-2 个量级
+    num_train_epochs=3,
+    eval_strategy="epoch",
+    predict_with_generate=True,  # 评测时真的跑解码，才能算 WER
+    logging_steps=10,
+    save_total_limit=2,
+)
+
+trainer = Seq2SeqTrainer(
+    model=model, args=args, train_dataset=split["train"],
+    eval_dataset=split["test"], data_collator=collate,
+    compute_metrics=compute_metrics,
+    processing_class=processor,   # 旧版 transformers 参数名叫 tokenizer=
+)
+trainer.train()
+trainer.save_model("output/whisper-lora/final")
+```
+
+**关键点解读**：
+
+- `target_modules=r"decoder\..*(q_proj|v_proj)"`：LoRA 只挂 Decoder 的注意力投影；**必须用正则限定 `decoder.*`**——Whisper 的 Encoder 里也有同名的 `q_proj/v_proj`，不限定的话 Encoder 会一起被微调（冻结 Encoder 的策略就失效了）；
+- `lora_rank=8`：秩，8-16 常用；
+- `learning_rate=1e-3`：LoRA 学习率通常比全量微调（~1e-5）高一到两个量级；
+- `labels` 里 padding 位置填 `-100`：`CrossEntropyLoss` 自动忽略这些位置；
+- 中文场景建议把 `compute_metrics` 里加一层归一化再算 WER/CER（4.1 节）；
+- 脚本骨架 API 以你安装版本的[官方文档](https://huggingface.co/docs/transformers/model_doc/whisper)为准。
+
+### 3.2 训练观察
 
 用 WandB 或框架自带日志盯三条曲线：
 
 1. **训练 Loss**：应平滑下降；若震荡 → 学习率过高；
-2. **验证 CER**：真正的目标指标（Loss 降 ≠ CER 降）；
+2. **验证 WER/CER**：真正的目标指标（Loss 降 ≠ CER 降）；
 3. **梯度范数**：异常飙升预示发散。
 
-**常见故障**（学习计划第 6 周要求掌握）：
+### 3.3 微调 SenseVoice / Paraformer：FunASR 官方脚本
+
+阿里官方为这两个模型提供 FunASR 微调入口（[SenseVoice 仓库 `finetune.sh`](https://github.com/FunAudioLLM/SenseVoice/blob/main/finetune.sh)），核心是调用 FunASR 自带的 `train_ds.py` 训练器：
+
+```bash
+git clone https://github.com/FunAudioLLM/SenseVoice.git
+cd SenseVoice
+# 数据格式见 data/train_example.jsonl：source=音频路径, target=文本
+bash finetune.sh    # 默认 iic/SenseVoiceSmall, lr=2e-4, 50 epoch
+```
+
+常见改法：小数据把 `train_conf.max_epoch` 调小（如 10-20）、`optim_conf.lr` 降到 1e-4 以下，避免过拟合。
+
+### 3.4 常见故障（学习计划第 6 周要求掌握）
 
 - **GPU OOM**：减 batch、开 gradient checkpointing、用 QLoRA；
 - **Loss 不收敛**：学习率过大、数据文本未规范化、音频采样率不一致；
@@ -129,11 +218,22 @@ CUDA_VISIBLE_DEVICES=0 swift sft \
 
 ### 4.1 CER 计算
 
+CER（Character Error Rate，字错误率）定义为**编辑距离除以参考文本长度**——分母是**参考（人工标注）的字数**，不是识别结果的字数，这一点必须记牢（WER 同理，分母是参考词数）：
+
+$$
+\text{CER} = \frac{S + D + I}{N_{\text{ref}}}
+$$
+
+**每个符号的物理含义**：$S$（Substitution）替换——参考是"起"识别成"齐"；$D$（Deletion）删除——参考有、识别结果漏掉的"漏字"；$I$（Insertion）插入——识别结果多出来的"幻听字"；$N_{\text{ref}}$ 是参考文本总字数。三个数由把"参考 → 假设"对齐所需的最少编辑操作统计而来。
+
+**算个小例子**：参考"量化感知训练"（6 字），识别成"量化感之训练"——1 个替换（知↔之），无删无插，CER = 1/6 ≈ 16.7%。若识别成"量化感训练"（漏了"知"），$D=1$，CER 同为 1/6——但根因完全不同（见 4.2 节归因分类学）。
+
 ```python
 from jiwer import cer
 
 def normalize_zh(s):
     import re
+    s = re.sub(r"<\|.*?\|>", "", s)   # SenseVoice 的 <|...|> 标签
     return re.sub(r"[，。！？、,.!?\s\"'《》<>()\[\]]", "", s).lower()
 
 refs = [normalize_zh(r) for r in ground_truths]
@@ -141,7 +241,9 @@ hyps = [normalize_zh(h) for h in predictions]
 print(f"CER = {cer(refs, hyps)*100:.2f}%")
 ```
 
-CER = (替换 + 删除 + 插入) / 参考总字数。三类错误要分开看——它们指向不同的根因。
+注意 `jiwer.cer` 传入**列表**时做的是**语料级聚合**：全部句子的编辑操作总数 ÷ 全部参考字数（本地实测：两句参考共 10 字、1 处插入 → 返回 0.1）。所以长句权重大于短句；若你想要"每句 CER 再平均"的宏平均，需自己逐句计算。中文按字错误率（character）算，`jiwer.cer` 直接支持；英文用 `jiwer.wer`（按词）。
+
+三类错误要分开看——它们指向不同的根因（下一节的归因表）。
 
 ### 4.2 逐条归因表（交付核心）
 
@@ -216,7 +318,7 @@ print(f"通用集 CER: {cer_general_before:.2%} -> {cer_general_after:.2%}")
 ## 本周交付清单
 
 - [ ] 准备 500-1000 条领域数据集（预标注 + 人工校对），统一 16 kHz。
-- [ ] 云端跑通一次 LoRA 微调（ms-swift 或官方脚本），记录 Loss 曲线。
+- [ ] 云端跑通一次 LoRA 微调（transformers+PEFT 或 FunASR 官方脚本），记录 Loss 曲线。
 - [ ] 输出微调前后 CER 对比表 + 逐条 bad case 归因表（≥5 条典型）。
 - [ ] 通用集回归测试，确认无灾难性遗忘。
 

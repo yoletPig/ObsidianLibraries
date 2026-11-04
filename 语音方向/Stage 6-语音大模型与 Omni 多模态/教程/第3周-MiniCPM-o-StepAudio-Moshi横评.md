@@ -3,12 +3,12 @@
 > **本周要回答的四个问题**
 > 1. 「半双工」与「全双工」的本质区别是什么？Moshi 用一条模型同时听和说，是怎么训练出来的？
 > 2. MiniCPM-o 为什么被称为「端侧友好的 Omni」？VAD 驱动的轮次管理怎么设计？
-> 3. Step-Audio 2 的双模型架构（理解+生成）与 Qwen2.5-Omni 的 Thinker-Talker 有何异同？
+> 3. Step-Audio 2 如何在同一个 LLM 里做「理解 + 语音生成」？它与 Qwen2.5-Omni 的 Thinker-Talker 分工有何异同？
 > 4. 全双工 / 端侧友好度 / 开源度 / 中文质量四维度横评，结论是什么？端侧选谁、云端选谁？
 
 对应学习计划：第 3 周。交付物：用统一 10 条语音指令测试集完成三大模型横评报告（响应延迟、首包延迟、回答质量、克隆相似度），给出端侧/云端选型结论。
 
-参考文献：*MiniCPM-o: Towards Multi-Modal Lightweight Large Language Model*（arXiv:2501.06231）、*Moshi: a speech-text foundation model for real-time dialogue*（arXiv:2410.00037）、*Step-Audio: Unified Understanding and Generation in Intelligent Speech Interaction*（arXiv:2502.11946）。
+参考文献：*Moshi: a speech-text foundation model for real-time dialogue*（arXiv:2410.00037）、*Step-Audio: Unified Understanding and Generation in Intelligent Speech Interaction*（arXiv:2502.11946）、*Step-Audio 2 Technical Report*（arXiv:2507.16632）、MiniCPM-o 2.6 技术报告（HuggingFace 模型卡 [openbmb/MiniCPM-o-2_6](https://huggingface.co/openbmb/MiniCPM-o-2_6) 与 [GitHub: OpenBMB/MiniCPM-o](https://github.com/OpenBMB/MiniCPM-o)，未以 arXiv 论文形式发布，架构细节以模型卡/仓库为准）。
 
 ---
 
@@ -27,7 +27,7 @@ $$
 P(u_t, m_t \mid u_{<t}, m_{<t})
 $$
 
-其中 $u_t$ 是用户声道、$m_t$ 是模型声道在时刻 $t$ 的 token。模型**永远在听也永远在说**（不说话时输出静音 token），没有显式轮次边界——抢话和附和自然涌现。
+**这个公式在干什么**：回合制把对话切成「整段输入 → 整段输出」两次独立推理；这个条件分布则把双方说的一切放进**同一条联合序列**里逐帧预测——$u_t$ 是用户声道在时刻 $t$ 的 token，$m_t$ 是模型声道的 token，条件 $u_{<t}, m_{<t}$ 是**两个声道各自全部的历史**。也就是说：模型生成 $m_t$（自己说什么）时永远看得到 $u_{<t}$（对方此刻说了什么），反之亦然。模型**永远在听也永远在说**（不说话时输出静音 token），没有显式轮次边界——抢话和附和自然涌现。
 
 ### 1.2 全双工的训练难题：数据从哪来
 
@@ -51,49 +51,52 @@ $$
 \text{用户音频} \xrightarrow{\text{Mimi}} \text{声学流} \;\; \Big|\;\; \text{文本流（模型的「内心独白」）}
 $$
 
-- **文本流**：模型先「在心里想文本」，再据此生成语音——这是把 Qwen2.5-Omni 的 Thinker-Talker 两模型分工**内化为同一个模型里的两条序列**；
-- **Depth Transformer**：声学侧用 Mimi 的多层 RVQ token。第一层（语义层）沿时间自回归建模，第 2~8 层（声学细节）用一个小深度 Transformer 在**每个时间步内**并行补全——与 VALL-E 的「AR 出第一层 + NAR 出后续层」（Stage 5 第 2 周学过）完全同构，只是压缩进同一个模型。
+- **文本流**：模型先「在心里想文本」，再据此生成语音——这是把 Qwen2.5-Omni 的 Thinker-Talker 两模型分工**内化为同一个模型里的两条序列**。每个 12.5 Hz 时间步里，主（temporal）Transformer 先产出 1 个文本 token + 1 个音频语义 token，声学细节再补全；
+- **Depth Transformer（也叫 RQ-Transformer）**：Mimi 的每个时间步有 8 层 RVQ token，若全部沿时间自回归，生成 1 帧要 8 步长程推理，太慢。Moshi 的拆法：**第 1 层（语义层）由主 Transformer 沿时间自回归建模；第 2~8 层（声学细节）交给一个很小的 Depth Transformer，在每个时间步内部逐个补全**。类比：主模型像播音员按时间线说话（80 ms 一帧），Depth Transformer 像调音师在同一帧内把音色、气息、底噪 7 个旋钮挨个拧好——每个旋钮只看本帧及其历史摘要，序列长度短、参数少，80 ms 内就能算完。
+
+> **与 VALL-E 的异同（Stage 5 第 2 周）**：两者都拆「第一层沿时间 AR + 后续层便宜地补」，但机制不同——VALL-E 的后续层是 **NAR 并行**（一枪打出全部 7 层）；Moshi 的 Depth Transformer 是**步内串行**（每步 7 个小自回归）。共同思想是：语义要长程因果建模，声学细节可以降级为更廉价的建模单元。面试时别把两者混为一谈。
 
 ### 2.2 Mimi codec 速览（第 4 周深拆）
 
-关键参数先记牢：12.5 Hz 帧率、8 层 RVQ、第一层是蒸馏自 WavLM 的**语义层**。12.5 Hz 是双工可行的前提——50 Hz 的 EnCodec 全层会让序列长到无法实时（第 4 节算账）。
+关键参数先记牢：12.5 Hz 帧率、8 层 RVQ（每层码本 2048）、第一层是蒸馏自 WavLM 的**语义层**。12.5 Hz 是双工可行的前提——50 Hz 的 EnCodec 全层会让序列长到无法实时（2.4 节算账）。
 
 ### 2.3 延迟与算力
 
-Moshi 论文报告理论延迟约 160 ms（音频分块），但**双声道 + 多层 RVQ 的建模量是回合制模型的好几倍**，实时推理需要专用优化（官方有 streaming 实现，PyTorch 版对硬件要求高）。这就是横评里「端侧友好度」要算的核心。
+Moshi 论文报告的理论延迟约 **160 ms**：80 ms 的 Mimi 帧长 + 80 ms 的前瞻（lookahead）帧。但**双声道 + 多层 RVQ + 文本流的建模量远大于回合制模型**，实时推理需要专用优化（官方 Rust 实现可实时，PyTorch 版对硬件要求高）。这就是横评里「端侧友好度」要算的核心。
 
 ### 2.4 为什么 12.5 Hz 是全双工的生死线（定量）
 
-全双工每一步要建模的量：两个声道 × 每声道 8 层 RVQ。按每秒生成的 token 数算账：
+**这段代码在干什么**：全双工系统每一秒要生成的语音 token 数 = 帧率 × RVQ 层数 × 声道数。它把几种「codec + 交互模式」组合的每秒 token 负载排在一起，回答一个问题：为什么 Moshi 必须把 codec 帧率压到 12.5 Hz。
 
 ```python
 def stream_tokens_per_second(hz, n_rvq_layers, n_channels):
     """每秒需要建模的语音 token 数。"""
     return hz * n_rvq_layers * n_channels
 
-duplex_mimi   = stream_tokens_per_second(12.5, 8, 2)   # Moshi: Mimi 双声道
-duplex_encodec = stream_tokens_per_second(50, 8, 2)    # 假想: EnCodec 双声道
-turnbased      = stream_tokens_per_second(25, 8, 1)    # 回合制: 单声道
-print(f"全双工 Mimi: {duplex_mimi} token/s")
-print(f"全双工 EnCodec: {duplex_encodec} token/s")
-print(f"回合制单声道: {turnbased} token/s")
-assert duplex_mimi < turnbased, "Mimi 双工负载必须低于回合制 50Hz，否则实时性无解"
+duplex_mimi     = stream_tokens_per_second(12.5, 8, 2)   # Moshi: Mimi 12.5Hz 双声道
+duplex_50hz     = stream_tokens_per_second(50, 8, 2)     # 假想: 50Hz codec（如 SoundStream）双声道
+turnbased_50hz  = stream_tokens_per_second(50, 8, 1)     # 回合制: 50Hz codec 单声道
+print(f"全双工 Mimi(12.5Hz): {duplex_mimi} token/s")
+print(f"全双工 50Hz codec: {duplex_50hz} token/s")
+print(f"回合制 50Hz codec: {turnbased_50hz} token/s")
+assert duplex_mimi < turnbased_50hz, "Mimi 双工负载必须低于 50Hz 单声道回合制，否则实时性无解"
 assert duplex_mimi == 200
 print("双工负载账验证通过 ✓")
 ```
 
-**预期输出**：200 / 800 / 200。关键洞察：Mimi 把帧率压到 12.5 Hz 后，**双声道的建模负载（200 token/s）恰好与 50 Hz 单声道回合制打平**——这就是「为什么全双工必须配低帧率 codec」的数字证据，也解释了第 4 周「codec 卷低码率」的另一个动机。
+**预期输出**：200 / 800 / 400。关键洞察：Mimi 把帧率压到 12.5 Hz 后，**双声道全双工的建模负载（200 token/s）只有 50 Hz codec 单声道回合制（400 token/s）的一半**；若用 50 Hz codec 做双工（800 token/s），负载直接翻两番，实时性基本无解——这就是「为什么全双工必须配低帧率 codec」的数字证据，也解释了第 4 周「codec 卷低码率」的另一个动机。
 
 ---
 
 ## 3. MiniCPM-o 2.6：端侧友好的 8B Omni
 
-### 3.1 架构要点（*MiniCPM-o* 技术报告）
+### 3.1 架构要点（MiniCPM-o 2.6 技术报告）
 
-- **多模态融合**：视觉（SigLIP 系 ViT）+ 音频（Whisper 系编码器）+ LLM 骨干（MiniCPM 系，约 8B），模态间用注意力融合而非简单拼接；
-- **实时语音对话**：采用**VAD 驱动的轮次管理**——系统侧持续跑 VAD，检测到用户停顿即触发模型回合；模型输出语音可被新的用户语音打断（打断由外部状态机管理，而非模型内生全双工）；
-- **音色克隆**：支持从参考音频提取音色，实时对话中用该音色回答——零样本克隆进了 Omni 交互；
-- **端侧叙事**：8B 是该团队瞄准手机/边缘设备的体积，配合量化可部署。注意：报告中的「端侧」指高端手机级算力，**不等于** 6 TOPS 的 RK3588——横评时别被叙事带偏。
+- **组件清单**（官方模型卡）：以端到端方式连接 **SigLIP-400M**（视觉编码器）+ **Whisper-medium-300M**（音频编码器）+ **ChatTTS-200M**（语音生成模块）+ **Qwen2.5-7B**（LLM 骨干），总参数约 **8B**——注意 LLM 骨干是 Qwen2.5-7B，不是 MiniCPM 自己的底座；
+- **实时流式机制（Omni-Streaming）**：把并行的多模态流按**时间分片（TDM，时分复用）**切成周期性的小时间片顺序处理，并把离线编码器/解码器改造成在线版本——这是它能在手机级设备上「边听边看边说」的工程基础；
+- **实时语音对话**：轮次管理由**外部状态机 + VAD** 驱动——检测到用户停顿即触发模型回合；模型输出语音可被新的用户语音打断（打断由外部状态机管理，而非模型内生全双工）；
+- **音色克隆**：通过「音频系统提示（audio system prompt）」注入参考音色，实时对话中用该音色回答——零样本克隆进了 Omni 交互；
+- **端侧叙事**：8B + int4 量化（官方称约 7 GB 显存）是该团队瞄准手机/边缘设备的体积。注意：报告中的「端侧」指高端手机/平板级算力，**不等于** 6 TOPS 的 RK3588——横评时别被叙事带偏。
 
 ### 3.2 VAD 驱动的轮次管理（可运行模拟）
 
@@ -142,13 +145,15 @@ MiniCPM-o 走的是「**回合制 + 工程优化**」路线：不打物理双工
 
 ---
 
-## 4. Step-Audio 2：双模型架构与语音化工具调用
+## 4. Step-Audio 2：单 LLM 内理解+生成与语音化工具调用
 
-### 4.1 架构要点（*Step-Audio* 系列）
+### 4.1 架构要点（*Step-Audio 2* 技术报告，arXiv:2507.16632）
 
-- **双模型**：Step-Audio 2（理解侧，130 MoE 激活 8B 量级）负责音频理解与文本推理；Step-Audio 2-TTS（生成侧）负责流式语音合成——「理解模型 + 生成模型」的分工与 Thinker/Talker **同构**，区别是 Talker 换成了一个独立的强 TTS 系统（带指令控制：方言、说唱、情感）；
-- **端到端语音理解**：直接吃音频特征，不依赖外挂 ASR；
-- **语音化工具调用**：把函数调用（function calling）能力做进语音交互——用户语音说「查下明天天气」，模型直接调工具并把结果说出来。这是语音 Agent 化的关键一步，你 Stage 9 方向的 VLA/Agent 知识在这里汇合。
+- **四个组件**（论文原文）：音频编码器（用 Qwen2-Audio 的编码器，输出 25 Hz 特征）→ 音频适配器（2× 降采样到 **12.5 Hz**）→ LLM 解码器 → 音频解 token 器（audio detokenizer，Flow Matching + HiFi-GAN，把语音 token 还原成波形）；
+- **生成进 LLM 内部**：与「理解模型 + 外挂 TTS」不同，Step-Audio 2 把**音频 token 的生成整合进语言建模**——LLM 直接输出文本与语音 token 交错（interleaved）的序列（语音 token 来自 CosyVoice 2 的 tokenizer，词表追加约 6.6K 个音频 token）。这与 Qwen2.5-Omni 的 Talker 思路同构：一个模型同时出文本和语音 token，区别是 Step-Audio 2 没有独立的 Talker 模块，语音 token 的比例是固定的；
+- **对比老一代**：2025 年 2 月的第一代 Step-Audio 是 **130B 参数的 MoE** 统一理解+生成模型；Step-Audio 2 参数量小得多（开源版 Step-Audio 2 mini 以 Qwen2.5-7B 初始化），靠 RL 与检索补强；
+- **训练配方**：预训练（约 8 百万小时音频+文本）之后是 SFT，再做**多阶段强化学习**（两段 PPO 限制思考序列长度 + GRPO）——这是语音模型里较早把 RLHF 系列技术做全的公开报告；
+- **语音化工具调用**：模型可调用 web search / audio search（数十万条语音的音色库，用于音色与风格切换）等工具——用户语音说「查下明天天气」，模型直接调工具并把结果说出来。这是语音 Agent 化的关键一步，你 VLA/Agent 方向的知识在这里汇合。
 
 ### 4.2 开源状态提示
 
@@ -217,7 +222,7 @@ print(json.dumps(aggregate_scores(demo), ensure_ascii=False))
 timer = TurnTimer()
 for ev in ["user_end", "first_token", "first_audio", "done"]:
     timer.mark(ev)
-print("延迟埋点字段:", list(TurnTimer().report.__doc__ and timer.report().keys()))
+print("延迟埋点字段:", list(timer.report().keys()))
 ```
 
 **预期输出**：质量分均值/方差表 + 三个延迟字段名。**人工打分方差 > 1.5 的条目必须重评**——评分者间分歧本身就是数据点。
@@ -241,7 +246,7 @@ print("延迟埋点字段:", list(TurnTimer().report.__doc__ and timer.report().
 | 中文指令准确率（/10） | 实测填 | 实测填 | 实测填 | 实测填 |
 | 打断成功率（第 8-9 条） | 实测填 | 实测填 | 实测填 | 实测填 |
 | 克隆音色相似度（主观 1-5） | 实测填 | 实测填 | 实测填 | — |
-| 参数量 / INT4 内存估算 | 7B / ~5 GB | 8B / ~5 GB | 填 | 7B / ~5 GB |
+| 参数量 / INT4 内存估算 | ~10.7B（Thinker 7B）/ ~5.5 GB | 8B / ~5 GB | 填（2 mini 约 8B） | 7B / ~4 GB |
 | 开源许可证 | 核实填 | 核实填 | 核实填 | 核实填 |
 
 **填表纪律**：所有延迟数字注明硬件与批次（如「A100, batch=1, 10 条均值」）；Moshi 若无法在你的云上实时运行，如实写「未达实时，仅离线评测」——**诚实的横评比完整的横评更有价值**。
@@ -261,7 +266,7 @@ print("延迟埋点字段:", list(TurnTimer().report.__doc__ and timer.report().
 ### 7.1 权衡
 
 - **全双工自然度 vs 算力**：双声道建模让延迟和算力成倍上升；产品上常用「回合制 + 快打断」以 20% 的成本换 80% 的体验。
-- **双模型分工 vs 单模型统一**：分工（Omni/Step-Audio 式）可控可审计；统一（Moshi 式）体验上限高但失败归因难。
+- **双模型分工 vs 单模型统一**：分工（Omni 式：Thinker + Talker）可控可审计；Step-Audio 2 是折中——单个 LLM 出文本/语音交错 token，再交独立解 token 器还原波形；统一（Moshi 式）体验上限高但失败归因难。
 - **克隆音色的隐私风险**：实时克隆用户声音意味着声纹数据上处理链路——端侧方案（你的项目）天然规避，云端方案必须写清数据政策。
 
 ### 7.2 失效模式

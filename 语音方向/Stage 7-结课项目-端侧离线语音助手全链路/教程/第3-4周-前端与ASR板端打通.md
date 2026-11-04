@@ -20,15 +20,19 @@ $$
 P_{\text{识别}} \approx P_{\text{前端保真}} \cdot P_{\text{ASR} \mid \text{SNR}}
 $$
 
+**这个公式在干什么**：它把端到端识别成功率拆成**两级条件概率相乘**——前端把语音「保真地」送过去的概率，乘以「在当前 SNR 下 ASR 能认对」的概率。级联链路的成功率是乘法而不是加法：假设前端丢真 10%（$P_1 = 0.9$）、ASR 在该 SNR 下认对 90%（$P_2 = 0.9$），端到端只有 $0.9 \times 0.9 = 0.81$，即 **五分之一的话在半路就丢了**。这也解释了两条工程结论：① 任何一级的提升都被另一级封顶（$P_2 = 0.5$ 时，$P_1$ 做到 1.0 也只有 0.5）；② 木桶效应——先补短板收益最大。
+
 ASR 模型在干净语音上的能力是固定的，**你能动的变量只有前端送进去的 SNR**。远场 3 米、电视背景音下，裸麦的 SNR 可能只有 5 dB，AEC+NS+AGC 能拉回 15 dB 以上——这一段的收益比换任何 ASR 模型都大。这是你 Stage 3 的结论，本周让它上板。
 
 ### 1.2 10 ms 帧的物理约束
 
-WebRTC APM 的处理粒度是 **10 ms 帧**（16 kHz 下 160 样本）。这个数字不可协商——AEC 的滤波器按帧对齐，VAD（Silero）也按 10 ms 设计。整条前端从采集开始就锁死 10 ms 节拍，任何模块引入额外缓冲都在直接加延迟：
+WebRTC APM 的处理粒度是 **10 ms 帧**（16 kHz 下 160 样本）。这个数字不可协商——AEC 的滤波器按帧对齐。Silero VAD 的窗口比 APM 粗：它在 16 kHz 下按 **512 样本（32 ms）窗**推理（sherpa-onnx 会把你喂进来的 10 ms 小块自动缓冲凑窗），所以整条前端的节拍由最细的 APM 锁死在 10 ms，VAD 的 32 ms 窗是叠加在其上的判定粒度。任何模块引入额外缓冲都在直接加延迟：
 
 $$
 T_{\text{前端}} = T_{\text{采集缓冲}} + T_{\text{APM 处理}} \le 10\,\text{ms} + \text{约 5\,ms}
 $$
+
+**这个公式在干什么**：它把「声音进麦克风 → 前端输出干净语音」这段固定延迟拆成两部分——$T_{\text{采集缓冲}}$ 是攒够一帧才交数据的等待时间（每帧 10 ms，攒几帧就乘几倍）；$T_{\text{APM 处理}}$ 是 APM 算完这一帧的时间（AEC+NS+AGC 在 16 kHz 10 ms 帧上通常只要几毫秒，量级参考：ARM 大核单帧远低于帧长，否则实时性就破了）。**结果拿来做什么**：它是全链路延迟预算里「前端」一行的填报依据——手算就是 1 帧 × 10 ms + 约 5 ms 处理 ≈ 15 ms，远小于预算。
 
 采集缓冲取 1 帧（10 ms）而不是常见的 4~8 帧，是端侧与桌面应用的关键差异——桌面要吞吐，端侧要延迟。
 
@@ -47,6 +51,8 @@ AEC 的原理：已知送往扬声器的信号 $s_t$（参考），从麦克风�
 $$
 \text{clean}_t = m_t - \hat{h} * s_t
 $$
+
+**这个公式在干什么**：扬声器播出的声音会经空气反弹回麦克风，这条「回声路径」可以用一个冲激响应 $h$ 描述（$*$ 是卷积，表示「过去一段时间内播出的声音按各自的延迟与衰减叠加进麦克风」）。AEC 用自适应滤波器在线估计这个 $h$ 得到 $\hat{h}$，然后**从麦克风信号里把回声的预测值减掉**，剩下的 $\text{clean}_t$ 才是真正的近端人声。符号含义：$m_t$ 是麦克风录到的信号（近端语音 + 回声 + 噪声）、$s_t$ 是我们**自己送出去**的参考（已知！）、$\hat{h} * s_t$ 是回声的估计。结果拿来做什么：减得越准，ASR 听到的「自言自语」越少。**公式的读法本身就是答案**——没有 $s_t$，减法无从谈起，回声只能当噪声盲处理，这就是「没有参考回路的 AEC 等于没做」的数学根源。
 
 **参考信号必须与播放严格同源同时间基**。两种接法：
 
@@ -85,11 +91,15 @@ $$
 \text{首字延迟} = \text{VAD 端点时刻} \to \text{文本产出时刻}
 $$
 
+**RTF 在干什么**：Real-Time Factor（实时率）衡量「处理 1 秒音频要花多少墙钟时间」——分子是解码一段音频实际花的秒数，分母是这段音频本身的秒数。RTF = 0.1 意思是「每段音频的处理时间只有它时长的 1/10」，<1 才能追上实时。**手算小例**：5 秒音频解码花 200 ms → RTF $= 0.2/5 = 0.04$；同一模型若换 0.2 → 解码要 1 s，流式场景下必然越攒越多。**结果拿来做什么**：它是跨音频长度可比较的归一化速度指标，压测表里报 RTF 而不是裸毫秒数。注意首字延迟是另一个口径：**端点时刻到文本产出**的绝对耗时，对应延迟预算表里的 200 ms——RTF 管吞吐口径，首字延迟管体验口径，两个都要报（Q2 有展开）。
+
 一致性对比：同 100 条测试音频，板端（ONNX）与云端（FunASR 原始权重）各跑一遍，比较：
 
 $$
 \text{一致率} = \frac{\text{转写完全相同的条数}}{100}, \qquad \text{要求} \ge 98\%
 $$
+
+**这个公式在干什么**：它把「板端部署有没有偷偷劣化」量化成一个整数比——分子是板端与云端**逐字相同**的条数。手算小例：100 条里 3 条出现个别字差异 → 一致率 97%，触发排查。注意它刻意用「转写是否相同」而不是「字错率」：目的是抓部署差异（量化/预处理漂移），不需要评分级的相似度。
 
 注意口径：**一致性比的是「同模型不同运行时」**，不是「板端模型与云端大模型的差距」——后者是模型差距，不是部署差距。混淆这两个口径是压测报告最常见的错误。
 
@@ -102,31 +112,37 @@ $$
 ```python
 import numpy as np
 import sounddevice as sd          # 板端底层走 ALSA
-from sherpa_onnx import VadModelConfig, VoiceActivityDetector
+import sherpa_onnx
 
 SR, FRAME = 16000, 160            # 16 kHz, 10 ms/帧
 
 def make_vad():
-    cfg = VadModelConfig()
-    cfg.silero_vad.onnx = "silero_vad.onnx"
+    cfg = sherpa_onnx.VadModelConfig()
+    cfg.silero_vad.model = "silero_vad.onnx"    # 注意字段名是 model，不是 onnx
     cfg.silero_vad.threshold = 0.5
     cfg.silero_vad.min_silence_duration = 0.4   # 尾部静默 400 ms 判定说完
     cfg.silero_vad.min_speech_duration = 0.25
     cfg.sample_rate = SR
-    return VoiceActivityDetector(cfg, buffer_size_in_seconds=30)
+    # Silero 内部按 window_size（16 kHz 下 512 样本 ≈ 32 ms）成窗推理，
+    # 10 ms 小块喂入时由 sherpa-onnx 自动缓冲凑窗
+    return sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=30)
 
 def capture_utterance(vad, stream):
     """阻塞直到采集到一个完整语音段，返回 (音频, 触发前保留的历史)。"""
     while True:
-        frame = stream.read(FRAME)                      # int16, (160,)
+        frame, overflowed = stream.read(FRAME)   # RawInputStream.read -> (buffer, overflowed)
         vad.accept_waveform(np.frombuffer(frame, np.int16).astype(np.float32) / 32768)
-        if not vad.is_empty():
+        if not vad.empty():
             seg = vad.front
             vad.pop()
-            return seg.samples, seg.start               # start 用于延迟埋点
+            return seg.samples, seg.start        # start 用于延迟埋点
+
+# stream 的打开方式（1 帧块大小的 RawInputStream）：
+# stream = sd.RawInputStream(samplerate=SR, channels=1, dtype="int16", blocksize=FRAME)
+# stream.start()
 ```
 
-**要点**：`buffer_size_in_seconds=30` 的环形缓冲自动保留触发前的音频——第 1-2 周讲的「防截头」在这里落地。
+**要点**：`buffer_size_in_seconds=30` 的环形缓冲自动保留触发前的音频——第 1-2 周讲的「防截头」在这里落地。API 字段与方法名（`silero_vad.model`、`vad.empty()`/`vad.front`/`vad.pop()`）以 sherpa-onnx 官方 Python 示例为准，跨版本可能微调，报错时先 `dir()` 核对。
 
 ### 4.2 SenseVoice 推理与延迟埋点
 
@@ -135,6 +151,8 @@ import time
 import sherpa_onnx
 
 def make_asr():
+    # from_sense_voice 官方签名（节选）：model, tokens, num_threads, use_itn,
+    # language（可为 "auto"/"zh"/"en"/"ja"/"ko"/"yue"）——参数名以所用版本为准
     return sherpa_onnx.OfflineRecognizer.from_sense_voice(
         model="sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.int8.onnx",
         tokens="sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tokens.txt",
@@ -152,7 +170,7 @@ def transcribe_with_timing(asr, samples):
 
 # 验收断言（交付时替换为板端真实数字）
 def accept_rtf(rtf, audio_s):
-    assert rtf < 0.1, f"RTF {rtf:.3f} 超过预算：5s 音频解码应 <500ms 的一半"
+    assert rtf < 0.1, f"RTF {rtf:.3f} 达不到 <0.1（换算：5 s 音频解码须 <500 ms）"
     assert audio_s > 0
 ```
 

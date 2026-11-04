@@ -6,7 +6,7 @@
 > 3. 端点检测（Endpointing）如何决定"这句话说完了"？判早了判晚了分别什么后果？
 > 4. 端到端首字延迟（First Token Latency）怎么拆预算？你的 200 ms 花在哪？
 
-对应学习计划：第 4 周。交付物：用流式模型实现实时转写脚本，按 60 ms chunk 喂入，打印增量识别结果与首字延迟。
+对应学习计划：第 4 周。交付物：用流式模型实现实时转写脚本，按 chunk_stride 喂入音频，打印累积识别结果与首字延迟。
 
 ---
 
@@ -20,7 +20,7 @@ $$
 \hat{y}_t \text{ 只能依赖 } x_1, x_2, \dots, x_t
 $$
 
-代价：看不到未来 → 消歧能力下降 → 同模型下流式精度通常比离线低 10-30%。所有流式设计的核心都是：**在"看多少未来"与"等多久才出字"之间找平衡**。
+代价：看不到未来 → 消歧能力下降 → 同模型下流式精度通常比离线略低（幅度取决于模型与 chunk/look-ahead 配置，需实测）。所有流式设计的核心都是：**在"看多少未来"与"等多久才出字"之间找平衡**。
 
 ### 1.2 三种流式架构
 
@@ -36,7 +36,7 @@ $$
 \text{端到端延迟} \approx \underbrace{\text{chunk 缓冲}}_{\text{攒够才算}} + \underbrace{\text{look-ahead}}_{\text{偷看未来}} + \underbrace{\text{计算耗时}}_{\text{模型前向}} + \underbrace{\text{端点检测}}_{\text{确认说完}}
 $$
 
-每一项都是"精度杠杆"——加大它精度升、延迟也升。
+**这个式子在干什么**：它把"用户说完一个字到系统给出结果"拆成四段可独立调参的开销。注意四项的量纲都是毫秒、可以相加：chunk 缓冲决定"攒多久才凑齐一块"，look-ahead 决定"为了看多远多等多少"，计算耗时是纯算力，端点检测只在句子结束才生效。**每一项都是"精度杠杆"**——加大它精度升、延迟也升。做延迟优化时先测四项各占多少，再挑最大的一项下手，而不是凭感觉改参数。
 
 ### 1.3 Chunk 大小的量化感觉
 
@@ -44,9 +44,9 @@ $$
 
 - chunk = 10 帧 = 100 ms：低延迟，但上下文短、精度差；
 - chunk = 20 帧 = 200 ms：折中；
-- chunk = 60 帧 = 600 ms：接近离线质量，但延迟高。
+- chunk = 60 帧 = 600 ms：接近离线质量，但延迟高——这正是 `paraformer-zh-streaming` 官方默认 `[0, 10, 5]` 配置（10 块 × 60 ms/块 = 600 ms）的量级。
 
-端侧语音助手通常选 100-200 ms chunk + 少量 look-ahead，把算法延迟控制在 200-300 ms。
+端侧语音助手通常选 100-200 ms chunk + 少量 look-ahead，把算法延迟控制在 200-300 ms（要求精度接近离线的听写类产品则放宽到 600 ms 量级，换取质量）。
 
 ---
 
@@ -97,7 +97,13 @@ $$
 ```python
 from funasr import AutoModel
 
-chunk_size = [5, 10, 5]   # [左看, 当前块, 右看(look-ahead)]，单位：帧(10ms)
+# 官方流式配置（funasr/paraformer-zh-streaming 模型卡）：
+# chunk_size 的单位是 60ms（960 样本 @16kHz）一个"块"：
+#   [0, 10, 5] = 左侧缓存用全部历史(0) + 当前块 10×60ms=600ms
+#                + 向右偷看 5×60ms=300ms(look-ahead)
+chunk_size = [0, 10, 5]
+chunk_stride = chunk_size[1] * 960    # 每次 generate 喂 9600 样本 = 600ms
+
 model = AutoModel(
     model="paraformer-zh-streaming",
     disable_update=True,
@@ -106,7 +112,7 @@ model = AutoModel(
 cache = {}                 # 跨 chunk 的状态缓存
 ```
 
-`chunk_size=[5,10,5]` 的含义：当前块 10 帧，向右偷看 5 帧（look-ahead），左侧 5 帧是历史缓存。这是延迟/精度的可调旋钮。
+**`chunk_size` 是延迟/精度的可调旋钮，但要按官方语义理解**（与很多人直觉不同的是它的单位不是 10ms 帧）：以 60 ms 为一个块单位，`[0, 10, 5]` 表示当前块 600 ms、look-ahead 300 ms，整体流式延迟约 600 ms；官方文档同时给出 `[0, 8, 4]`（480 ms）等更快配置。**每次喂给 `generate` 的音频长度必须等于 `chunk_stride = chunk_size[1] × 960` 样本**，否则内部缓存状态会对不齐。
 
 ### 4.2 实时转写循环
 
@@ -120,9 +126,7 @@ if wave.ndim > 1:
     wave = wave.mean(axis=1)
 assert sr == 16000, "流式模型要求 16kHz"
 
-# 每帧 10 ms = 160 样本（16 kHz 下 10ms × 16 样本/ms）。
-# 一个 10 帧的 chunk = 10 × 160 = 1600 样本 = 100 ms。
-chunk_stride = 1600                   # 100 ms 一块
+chunk_stride = chunk_size[1] * 960    # 9600 样本 = 600 ms（官方示例配置）
 n_chunks = int(np.ceil(len(wave) / chunk_stride))
 
 cache = {}
@@ -134,9 +138,11 @@ for i in range(n_chunks):
     is_final = (i == n_chunks - 1)
     res = model.generate(
         input=chunk,
-        cache=cache,
+        cache=cache,                    # 状态缓存：读进来、传回去
         is_final=is_final,
         chunk_size=chunk_size,
+        encoder_chunk_look_back=4,      # 官方示例参数：encoder 回看历史块数
+        decoder_chunk_look_back=1,
     )
     text = res[0]["text"] if res else ""
     if text and first_token_time is None:
@@ -150,9 +156,11 @@ if first_token_time is not None:
     print(f"首字延迟（相对处理起点）: {first_token_time*1000:.0f} ms")
 ```
 
-**预期**：每 100 ms 一个 chunk 打印增量识别结果，句子末尾输出最终文本，并显示首字延迟。
+**`cache` 是怎么工作的**：FunASR 流式模型把"上一块留下的卷积上下文/注意力缓存"装在 `cache` 这个 dict 里——每次调用**传入**它、结果里**更新**它，你必须复用同一个 dict 对象；换一个新的就等于每块都失忆。另外注意 `res[0]["text"]` 是**累积式**输出（到目前为止的完整结果），每次打印自然呈现 2.2 节说的"partial 边打字边修正"效果。
 
-**注意**：上面的延迟是"从开始喂第一个 chunk 到出第一个字"的**算法延迟**（含攒块 + 前向）。真实麦克风采集还要叠加**采集缓冲**与**播放延迟**，端到端预算要单独核算。
+**预期**：每 600 ms 一个 chunk 打印一次累积识别结果，句子末尾输出最终文本，并显示首字延迟。想体验更低延迟，可把 `chunk_size` 改成 `[0, 8, 4]` 并同步缩小 `chunk_stride`。
+
+**注意**：上面的延迟是"从开始喂第一个 chunk 到出第一个字"的**算法延迟**（含攒块 + look-ahead + 前向）。真实麦克风采集还要叠加**采集缓冲**与**播放延迟**，端到端预算要单独核算。
 
 ### 4.3 首字延迟预算拆解（交付）
 
@@ -162,7 +170,7 @@ if first_token_time is not None:
 | --- | --- | --- |
 | 麦克风采集缓冲 | ~30 ms | 几帧采集延迟 |
 | VAD 端点确认 | ~200 ms | 静音判定的必要等待 |
-| ASR 流式（攒块+前向） | ~150 ms | chunk 100ms + 计算 |
+| ASR 流式（攒块+前向） | ~150 ms | 按小 chunk（约 100 ms）配置估算；`paraformer-zh-streaming` 默认 600 ms 配置则此项约 650 ms |
 | LLM 首 token | ~400 ms | 端侧量化模型 |
 | TTS 首包 | ~200 ms | 流式合成 |
 | **合计** | **~1.0 s** | 目标 < 1.5 s |
@@ -176,7 +184,7 @@ if first_token_time is not None:
 ### 5.1 权衡
 
 - **chunk 大小**：小 → 低延迟、高精度损失；大 → 反之。100-200 ms 是甜点；
-- **look-ahead**：每多看 1 帧 = 多 10 ms 延迟，换一点消歧。通常 3-5 帧；
+- **look-ahead**：每多看 1 帧就多等 1 帧的延迟（10 ms 帧制下即 10 ms；FunASR 流式以 60 ms 块为单位，即每多 1 块多 60 ms），换一点消歧。通常 3-5 帧；
 - **partial 修订**：频繁修订体验差，但不修订会显示错误中间结果。控制修订窗口。
 
 ### 5.2 失效模式
@@ -193,8 +201,8 @@ if first_token_time is not None:
 **Q1**：为什么流式 ASR 天然比离线精度低？差距能完全消除吗？
 **A**：因果约束使其无法利用未来上下文消歧，信息量客观更少。不能消除，只能靠 look-ahead、更强模型、更大训练数据缩小差距。
 
-**Q2**：`chunk_size=[5,10,5]` 中三个数分别是什么？把第三个数改成 0 会怎样？
-**A**：[左缓存, 当前块, 右 look-ahead]。第三个改 0 = 不看未来，延迟最低但消歧能力下降，精度降低。
+**Q2**：`chunk_size=[0,10,5]` 中三个数分别是什么？把第三个数改成 0 会怎样？
+**A**：单位是 60 ms/块：第一个数是左侧上下文（0 = 缓存使用全部历史），第二个是当前块数（10×60=600 ms），第三个是右 look-ahead（5×60=300 ms）。第三个改 0 = 不看未来，延迟最低但消歧能力下降，精度降低。
 
 **Q3**：端点检测判早与判晚，哪个对语音助手体验更致命？为什么？
 **A**：判早更致命——它直接切断用户正在说的话，造成漏识别且用户无法补救；判晚只是多等一点，用户可感知但信息完整。
@@ -209,7 +217,7 @@ if first_token_time is not None:
 
 ## 本周交付清单
 
-- [ ] 跑通 `paraformer-zh-streaming`，按 100 ms chunk 增量转写并打印。
+- [ ] 跑通 `paraformer-zh-streaming`（官方 `[0,10,5]` 配置），按 600 ms chunk 增量转写并打印。
 - [ ] 测量并记录首字延迟（算法延迟），与离线识别的 CER 对比流式精度损失。
 - [ ] 实验 `chunk_size` 第三项（look-ahead）= 0 / 5 的精度-延迟差异。
 - [ ] 建立端到端延迟预算表（结课项目雏形）。

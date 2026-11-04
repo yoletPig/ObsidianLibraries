@@ -13,7 +13,7 @@
 
 ### 1.1 VALL-E 的核心洞察
 
-传统 TTS 生成的是**连续**的梅尔谱。VALL-E（Neural Codec Language Models are Zero-Shot TTS）的洞察：
+传统 TTS 生成的是**连续**的梅尔谱。VALL-E（Wang et al., Microsoft, 2023, arXiv:2301.02111，全名 *Neural Codec Language Models are Zero-Shot Text to Speech Synthesizers*）的洞察：
 
 > 如果把语音编码成**离散的 codec token**，那么 TTS 就变成了一个标准的**语言建模问题**——给定文本 token，自回归地预测语音 token。
 
@@ -31,7 +31,7 @@ $$
 \text{prompt：参考音频的 codec token} + \text{目标文本} \;\to\; \text{目标语音的 codec token}
 $$
 
-模型见过海量"同一说话人不同句子"的数据，学会了"参考音频 → 该音色"的映射。给它 3-10 秒参考音频作为 prompt，它就能续写出同样音色的新内容——**不需要任何微调**。
+模型见过海量"同一说话人不同句子"的数据，学会了"参考音频 → 该音色"的映射。给它几秒参考音频（论文用 3 秒录音）作为 prompt，它就能续写出同样音色的新内容——**不需要任何微调**。
 
 这就是零样本克隆的通用配方：
 
@@ -45,19 +45,21 @@ $$
 
 ### 2.1 Neural Audio Codec 是什么
 
-音频 codec（编解码器）把波形压缩成紧凑的离散表示，再重建波形。EnCodec / SoundStream / DAC 都是这类。结构：
+音频 codec（编解码器）把波形压缩成紧凑的离散表示，再重建波形。代表工作：**SoundStream**（Zeghidour et al., Google, 2021，首次把 RVQ 用进神经音频编解码）、**EnCodec**（Défossez et al., Meta, 2022）、**DAC / Descript Audio Codec**（Kumar et al., Descript, 2023，改进 RVQGAN，主打 44.1 kHz 高保真）。结构都是同一副骨架：
 
 $$
 \text{波形} \xrightarrow{\text{Encoder}} \text{连续特征} \xrightarrow{\text{RVQ}} \text{离散 token} \xrightarrow{\text{Decoder}} \text{重建波形}
 $$
 
+各环节的分工：Encoder 是个下采样卷积网络，把每秒几万个采样点压成每秒几十~上百个连续向量；RVQ 把每个向量变成一小组离散码；Decoder 是上采样网络，把离散码还原回波形——**端到端训练，目标是"重建出来的波形听不出和原声的差别"**。
+
 ### 2.2 RVQ（Residual Vector Quantization，残差向量量化）
 
 这是离散化的核心，也是与"量化方向"联动的关键。
 
-**普通向量量化（VQ）**：把连续向量映射到最近的码本（codebook）向量。但单个码本表达力有限。
+**普通向量量化（VQ）**：把连续向量 $z$ 映射到码本（codebook）里**最近**的那个向量。**这个操作在干什么**：相当于"只允许用字典里的词说话"——$z$ 是千变万化的连续点，码本是有限的 $K$ 个"标准点"，量化 = 找到离你最近的标准点并记住它的编号（编号就是 token）。**代价**：最近的替代点与原点的距离就是量化误差；单个码本（哪怕 1024 个向量）表达力有限，误差太大。
 
-**RVQ 的递进思想**：第一层量化后，对**残差**（原向量 - 第一层重建）再量化，层层递进：
+**RVQ 的递进思想**：一次量化不准，就对**误差**再量化一次，层层套娃，误差越滚越小：
 
 $$
 r_0 = z \quad \text{（原始连续特征）}
@@ -78,9 +80,25 @@ $$
 \hat{z} = c_1 + c_2 + \cdots + c_N
 $$
 
-**每层 codebook 建模什么**：
-- **第 1 层**：最主要的信息——**语义/内容**（说了什么）；
-- **后续层**：逐层细化的**声学细节**（音色、音质）。
+**逐符号拆解**：$r_i$ 是第 $i$ 步开始时"还没被表达出来的误差"；$\text{Quantize}(\cdot)$ 是"在码本里找最近向量"；$c_i$ 是这一层选中的码字（它的**索引**才是存下来的 token）；$r_{i} = r_{i-1} - c_i$ 把已表达的部分减掉，剩下的残差交给下一层。**因为 $r_0 = r_1 + c_1$ 恒成立、逐层展开，所以 $N$ 层之后 $z = (c_1 + \cdots + c_N) + r_N$——只要层数够多，误差 $r_N$ 想多小有多小。**
+
+**手算小例**（把向量简化成一维标量感受一下）：设 $z = 7.3$，每层码本粒度逐层变细——第 1 层码本是整数，第 2 层是 $\{0, \pm 0.25, \pm 0.5, \dots\}$，第 3 层是 $\{0, \pm 0.05, \dots\}$：
+
+| 层 | 输入残差 $r_{i-1}$ | 选中码字 $c_i$ | 剩余残差 $r_i$ |
+| --- | --- | --- | --- |
+| 1 | 7.3 | 7 | 0.3 |
+| 2 | 0.3 | 0.25 | 0.05 |
+| 3 | 0.05 | 0.05 | 0.0 |
+
+三层之后重建 $\hat{z} = 7 + 0.25 + 0.05 = 7.3$，误差归零；只用第 1 层则差 0.3。**这就是"套娃"：每层只负责修正上一层没画好的部分，层码本不需要表达"全世界"，只需要表达"剩下的误差"。**
+
+**每层 codebook 大致在建模什么**（经验规律，不是严格定理）：
+- **第 1 层**：主体信息——**内容与韵律骨架**（说了什么、怎么抑扬顿挫）；
+- **后续层**：逐层细化的**声学细节**（音色纹理、相位、音质）。
+
+注意：这是 EnCodec 这类**声学重建导向** codec 的经验分层，第 1 层仍是"声学 token"而非干净的语义表示——它混合了内容与音色。这正是第 3-4 周要讲的 CosyVoice 改用"监督语义 token"的动机。
+
+> **动手验证**：2.3 节 4.2 小节的实验就是这个分层的直接证据——只用第 1 层重建 vs 全层重建，用耳朵对比。
 
 **这个分层结构与量化方向的联系**：
 - RVQ 是**向量量化**（把向量映射到码本）；
@@ -89,12 +107,13 @@ $$
 
 ### 2.3 比特率计算（本周自测题）
 
-EnCodec 的关键参数：
-- 采样率 24 kHz；
-- 帧率 75 Hz（每秒 75 个时间步）；
-- 8 层 RVQ，每层 codebook 大小 1024（$2^{10}$，即每个时间步每层 10 bit）。
+EnCodec 24 kHz 模型的关键参数（Défossez et al., 2022）：
+- 采样率 24 kHz，**单声道**；
+- 帧率 75 Hz（每秒 75 个时间步，encoder 总下采样步长 320）；
+- RVQ **最多 32 层**，每层 codebook 大小 1024（$2^{10}$，即每个时间步每层 10 bit）；
+- 支持的码率档位：1.5 / 3 / 6 / 12 / 24 kbps，**分别对应只启用前 2 / 4 / 8 / 16 / 32 层**。
 
-**计算 1 秒语音的 token 数**：
+**计算 1 秒语音的 token 数（6 kbps 档 = 8 层，即 VALL-E 用的配置）**：
 
 $$
 75 \text{ 帧/秒} \times 8 \text{ 层} = 600 \text{ token/秒}
@@ -106,9 +125,17 @@ $$
 75 \times 8 \text{ 层} \times 10 \text{ bit} = 6000 \text{ bit/s} = 6 \text{ kbps}
 $$
 
-对比：无损音频约 1411 kbps（CD），EnCodec 用 6 kbps 就能重建出高质量语音——压缩比惊人。这正是"语音可以被极度压缩成离散表示"的证据，也是 LM-based TTS 可行的基础。
+对比：无损 CD 音频约 1411 kbps，EnCodec 用 6 kbps 就能重建出高质量语音——压缩比超过 200 倍。这正是"语音可以被极度压缩成离散表示"的证据，也是 LM-based TTS 可行的基础。
 
-**不同码率**：EnCodec 支持 1.5/3/6/12/24 kbps，通过**只用前几层 RVQ** 实现（码率越低用越少层，音质越差）。
+| 码率 | 启用层数 | 1 秒 token 数 |
+| --- | --- | --- |
+| 1.5 kbps | 2 | 150 |
+| 3 kbps | 4 | 300 |
+| 6 kbps | 8 | 600 |
+| 12 kbps | 16 | 1200 |
+| 24 kbps | 32 | 2400 |
+
+> **一句话总结**：token 越多 = 比特率越高 = 音质越好 = 后续语言建模负担越重。VALL-E 选 8 层，就是在"音质"与"序列长度"之间取的折衷。
 
 ---
 
@@ -116,15 +143,15 @@ $$
 
 ### 3.1 AR + NAR
 
-VALL-E 把 8 层 RVQ 分两阶段生成：
+VALL-E 用 EnCodec 的**前 8 层** RVQ（即 6 kbps 档配置），把生成分两阶段：
 
-1. **AR（自回归）模型**：生成**第 1 层** codec token（沿时间自回归）。第 1 层承载语义，决定"说什么、什么韵律"；
-2. **NAR（非自回归）模型**：以第 1 层 + 文本为条件，**并行**生成第 2-8 层（声学细节）。
+1. **AR（自回归）模型**：沿时间轴逐帧生成**第 1 层** codec token。第 1 层承载内容与韵律骨架，决定"说什么、什么节奏"；
+2. **NAR（非自回归）模型**：以第 1 层 + 文本为条件，生成第 2–8 层（声学细节）。**注意"非自回归"的方向**：沿**时间**是并行的（一整句的所有帧一次算完），沿**层间**仍是串行的——生成第 $i$ 层时要看着第 $i-1$ 层，一层一层补细节。
 
 ### 3.2 为什么这样分
 
-- 第 1 层（语义）需要时序建模 → 适合自回归；
-- 后续层（声学细节）依赖第 1 层但彼此并行 → 适合非自回归。
+- 第 1 层（内容/韵律）需要长程时序建模 → 适合自回归（和时间轴逐点"接龙"）；
+- 后续层（声学细节）给定第 1 层后基本是"逐帧填色"，无长程依赖 → 沿时间并行，速度快。
 
 **这个"先语义后声学"的两段式，是后续所有 LM-based TTS 的共同骨架**（CosyVoice、MaskGCT 都是变体）。
 
@@ -157,23 +184,23 @@ import numpy as np
 from encodec import EncodecModel
 from encodec.utils import convert_audio
 
-# 加载 EnCodec 24kHz 模型
+# 加载 EnCodec 24kHz 模型（单声道；首次运行会自动下载权重）
 model = EncodecModel.encodec_model_24khz()
-model.set_target_bandwidth(6.0)        # 6 kbps -> 用 8 层中的前几层
+model.set_target_bandwidth(6.0)        # 6 kbps -> 启用前 8 层 RVQ（档位见 2.3 节表格）
 
 # 载入音频并适配
 wav, sr = sf.read("my_voice.wav", dtype="float32")
 if wav.ndim == 1:
     wav = wav[None, :]                  # (1, N)
-wav_t = torch.from_numpy(wav).unsqueeze(0)   # (1, 1, N)
-wav_t = convert_audio(wav_t, sr, model.sample_rate, model.channels)
+wav_t = torch.from_numpy(wav).unsqueeze(0)   # (B=1, C=1, N)
+wav_t = convert_audio(wav_t, sr, model.sample_rate, model.channels)  # 重采样到 24kHz、混缩声道
 
 with torch.no_grad():
-    encoded_frames = model.encode(wav_t)
+    encoded_frames = model.encode(wav_t)   # 返回 list，每项是 (codes, scale)
 
-# 提取 codes: (batch, layers, time)
+# 提取 codes: (batch, n_q, time)，n_q = 当前带宽档位启用的层数
 codes = torch.cat([f[0] for f in encoded_frames], dim=-1)
-print("codes shape:", codes.shape)      # (1, n_layers, T)
+print("codes shape:", codes.shape)      # (1, 8, ~75T)
 
 n_layers, T = codes.shape[1], codes.shape[2]
 duration = len(wav) / sr
@@ -183,23 +210,35 @@ print(f"层数: {n_layers}, 每层词表: 1024")
 print(f"1 秒语音 = {tokens_per_sec:.0f} 帧 × {n_layers} 层 = {tokens_per_sec*n_layers:.0f} token")
 ```
 
-**预期**：24 kHz、6 kbps 下，帧率约 75 Hz，8 层 → 1 秒约 600 token。
+**预期**：24 kHz、6 kbps 档下，帧率约 75 Hz、8 层 → 1 秒约 600 token；把 `set_target_bandwidth` 改成 1.5，`codes.shape[1]` 会变成 2（2 层）——这就是"低码率 = 少用几层套娃"的直接证据。
 
-### 4.2 验证"第 1 层是语义、后续层是音质"
+### 4.2 验证"第 1 层保内容骨架、后续层保音质"
+
+最省事的对比方法：用带宽档位控制层数（1.5 kbps 档只启用前 2 层，6 kbps 档启用 8 层），同一段音频各重建一次：
 
 ```python
-# 只用第 1 层解码：内容对但音色丢失
-with torch.no_grad():
-    # 只保留第 1 层，其余置零/丢弃（按 API 调整）
-    first_layer_only = codes[:, :1, :]
-    # 重建（需要把单层的 codes 喂回 decoder）
-    # reconstructed = model.decode(...)
-print("对比：全 8 层重建（完整音质） vs 仅第 1 层重建（内容对、音色丢）")
+import torchaudio
+
+for bw, n_q in [(1.5, 2), (6.0, 8)]:      # 24kHz 模型码率档位 -> 启用层数（见 2.3 节表格）
+    model.set_target_bandwidth(bw)
+    with torch.no_grad():
+        frames = model.encode(wav_t)
+        recon = model.decode(frames)          # (1, 1, N)，重建波形
+    torchaudio.save(f"recon_{bw}kbps.wav", recon.squeeze(0), model.sample_rate)
+    print(f"{bw} kbps 档（启用前 {n_q} 层）：已保存 recon_{bw}kbps.wav")
 ```
 
-**观察点**：仅用第 1 层重建，能听出"说了什么"，但音色、音质明显丢失——**直接证明第 1 层承载语义、后续层承载声学细节**。这是本周最有价值的实验。
+**观察点**：1.5 kbps（2 层）版本能听出"说了什么"、韵律还在，但音质明显劣化、发闷发糊；6 kbps（8 层）版本接近原声。这印证了 2.2 节的分层规律——**前几层承载内容与韵律骨架，后续层补齐音色与音质细节**。注意结论要留有余地：EnCodec 是声学重建导向的，第 1 层并不是"纯语义"，只是信息占比上更偏内容。这是本周最有价值的实验。
 
 ### 4.3 用 LLM 算语音 token 的困惑度（进阶）
+
+困惑度（Perplexity, PPL）定义为平均负对数似然的指数：
+
+$$
+\text{PPL} = \exp\left( -\frac{1}{N} \sum_{i=1}^{N} \log p(x_i \mid x_{<i}) \right)
+$$
+
+**这个公式在干什么**：把"模型每一步的预测分布"折算成一个"等效候选数"。若模型预测很准（$p \to 1$），$\log p \to 0$，PPL $\to 1$（等于闭卷抄答案）；若模型完全瞎猜（词表 $V=1024$ 上的均匀分布，$p = 1/1024$），PPL $= 1024$——**这就是"随机基线 PPL = 词表大小"的由来**。PPL = 50 的直观含义：模型每一步的不确定性约等于"在 50 个候选里挑"。
 
 ```python
 # 把第 1 层 token 序列当作"语言"，用一个小型 LM 计算困惑度
@@ -231,8 +270,8 @@ print("对比：全 8 层重建（完整音质） vs 仅第 1 层重建（内容
 
 ## 6. 延伸思考题（含解析）
 
-**Q1**：EnCodec 24 kHz、8 层 RVQ、每层 1024 词表，1 秒语音的 token 数与比特率？
-**A**：75 帧/秒 × 8 层 = 600 token/秒；比特率 = 75 × 8 × 10 bit = 6 kbps。
+**Q1**：EnCodec 24 kHz、启用前 8 层 RVQ（即 6 kbps 档）、每层 1024 词表，1 秒语音的 token 数与比特率？
+**A**：75 帧/秒 × 8 层 = 600 token/秒；比特率 = 75 × 8 × 10 bit = 6 kbps。注意 8 层不是 EnCodec 的上限——24 kHz 模型最多 32 层（24 kbps），VALL-E 只用前 8 层。
 
 **Q2**：RVQ 为什么分层？每层在建模什么？
 **A**：第 1 层量化主体（语义/内容），后续层逐层量化残差（声学细节、音色）。分层让"内容"与"音质"解耦，可按需取用（低码率只用前几层）。

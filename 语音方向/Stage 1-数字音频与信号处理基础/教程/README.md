@@ -30,3 +30,5 @@ pip install numpy scipy librosa soundfile matplotlib torchaudio
 ```
 
 每篇教程的代码块都标注了预期输出，跑通后与预期不符时先检查采样率与数组维度，90% 的问题出在这两处。
+
+> **版本提示**：教程中的数值均基于 Python 3.10 + numpy 2.x + scipy 1.15 + librosa 0.11 验证。特别地，librosa 与 torchaudio 的 Mel 滤波器组**默认约定不同**（librosa 默认 Slaney 刻度 + slaney 归一化，torchaudio 默认 HTK 刻度），第 3 周会专门拆解这一点。另外 torchaudio 2.9 起音频读写后端移交 TorchCodec，特征提取 API（`compliance`/`transforms`）不受影响。

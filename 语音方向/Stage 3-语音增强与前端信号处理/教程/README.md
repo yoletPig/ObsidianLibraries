@@ -18,9 +18,22 @@ $$
 \text{麦克风原始信号} \xrightarrow{\text{AEC 去回声}} \xrightarrow{\text{NS 降噪}} \xrightarrow{\text{AGC 稳音量}} \xrightarrow{\text{VAD 判活}} \text{干净语音} \xrightarrow{\text{ASR}}
 $$
 
-**顺序是硬约束**：AEC 必须在 NS 之前（降噪会破坏回声路径的线性结构），这个顺序问题是本周自测的工程直觉题。
+**顺序是硬约束**：AEC 必须在 NS 之前（降噪会破坏回声路径的线性结构），这个顺序问题是第 3、5-6 周自测的工程直觉题。
 
 ## 前置依赖
 
-- Stage 1 第 4 周的 `mix_at_snr()`、`spectral_subtraction()`、`evaluate()`（PESQ/STOI）会被直接复用；
-- 依赖：`pip install deepfilternet speechbrain asteroid onnxruntime`，以及 WebRTC APM 的 Python 绑定。
+- Stage 1 第 4 周的 `mix_at_snr()`、`spectral_subtraction()`、`evaluate()`，以及第 2 周的 `stft()` / `istft()` 会被直接复用；
+- 依赖安装（分周按需）：
+
+```bash
+# 第 1 周：指标评测
+pip install numpy scipy pesq pystoi librosa soundfile matplotlib
+# 第 2 周：深度降噪（含默认 DeepFilterNet3 预训练权重）
+pip install deepfilternet        # 依赖 torch/torchaudio
+# 第 2 周 ONNX 延迟测试（可选）
+pip install onnxruntime
+# 第 4 周：Silero VAD（复用 torch）；第 5-6 周：WebRTC NS+AGC 绑定与 ASR
+pip install webrtc-noise-gain funasr jiwer
+```
+
+> 注意：`webrtc-noise-gain` 只包含 NS + AGC + VAD（**不含 AEC**）；完整 AEC3 目前没有维护良好的纯 pip 绑定，详见第 3、5-6 周教程的说明。

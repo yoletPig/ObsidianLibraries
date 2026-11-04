@@ -20,6 +20,8 @@ $$
 \text{AEC（线性对齐消回声）} \;\to\; \text{NS（非线性去噪）} \;\to\; \text{AGC} \;\to\; \text{VAD}
 $$
 
+**这条链在干什么**：把四个模块按"破坏性"排序——越靠前的模块对信号的改动越"温柔、可逆、线性"，越靠后越"自由、非线性"。AEC 做的是减法（减去与参考线性相关的回声），必须最先；NS 做谱整形（乘时变增益）；AGC 乘整体增益（最温和，但会改变后续模块看到的电平）；VAD 只做判决不改信号，放最后还能享受前面所有处理的红利。**任何一个对信号做了非线性改动的模块，都会让排在它后面的"依赖线性结构"的模块失效**——这就是顺序的因果逻辑。
+
 ### 1.2 为什么 AGC 在 NS 后
 
 降噪需要稳定的信噪比估计；若先 AGC 放大弱信号，噪声也被放大，干扰降噪的噪声谱估计。先降噪稳住信号，再 AGC 调响度。
@@ -53,21 +55,24 @@ VAD 需要尽可能干净的信号来判断"是否有语音"；放在链尾受�
 ### 2.3 Python 调用
 
 ```bash
-pip install webrtc-noise-gain       # NS + AGC
-# 或 webrtc-audio-processing 完整绑定（含 AEC）
+pip install webrtc-noise-gain       # NS + AGC + VAD（基于 freedesktop webrtc-audio-processing）
 ```
 
 ```python
-# 以 webrtc-noise-gain 为例（NS + AGC）
-from webrtc_noise_gain import AudioProcessing
+import numpy as np
+from webrtc_noise_gain import AudioProcessor
 
-ap = AudioProcessing()
-ap.set_stream_delay_ms(0)
-# NS 与 AGC 的开关/档位按绑定 API 设置
-# AEC 需完整绑定，接口以官方为准
+# 参数：auto_gain 0-31（目标 dBFS，0=关闭）；noise_suppression 0-4（抑制强度，0=关闭）
+# 输入：16 kHz 单声道 int16；每次处理 10 ms = 160 样本 = 320 字节
+ap = AudioProcessor(15, 2)
+
+chunk_in = (np.random.randn(160) * 1000).astype(np.int16).tobytes()
+out = ap.Process10ms(chunk_in)
+print(out.is_speech)                          # 内置 VAD 的判决
+print(np.frombuffer(out.audio, dtype=np.int16).shape)   # (160,) 处理后的 10 ms 音频
 ```
 
-（AEC3 的完整 Python 绑定较少，生产常用 C++ 或 `webrtc-audio-processing`。本周重点是**理解流水线与配置权衡**，绑定细节按你的环境选。）
+**关于 AEC 的现实情况**：这个包**不含 AEC**；PyPI 上名为 `webrtc-audio-processing` 的旧绑定（0.1.3）基于约 2016 年的 C++ 库 v0.3（老 AEC 而非 AEC3），维护也停滞。要在 Python 里跑真正的 AEC3，目前需自行编译 freedesktop 的 webrtc-audio-processing（≥1.0 含 AEC3）并写绑定。因此本教程流水线中 AEC 用第 3 周的手写 NLMS 作为占位实现，NS/AGC/VAD 用上面的包真实接入。
 
 ---
 
@@ -77,15 +82,18 @@ ap.set_stream_delay_ms(0)
 
 ```python
 import numpy as np
+import torch
 
 class SpeechFrontend:
     """
     录音 -> AEC -> NS -> AGC -> VAD 的完整前端。
     各模块可开关，用于消融实验。
+    NS/AGC 用 webrtc-noise-gain 真实接入；AEC 留接入点（第 3 周 NLMS 或自编译 AEC3）。
     """
     def __init__(self, sr=16000,
                  enable_aec=True, enable_ns=True,
                  enable_agc=True, enable_vad=True):
+        assert sr == 16000, "webrtc-noise-gain 仅支持 16 kHz"
         self.sr = sr
         self.enable_aec = enable_aec
         self.enable_ns = enable_ns
@@ -94,15 +102,7 @@ class SpeechFrontend:
         self._init_modules()
 
     def _init_modules(self):
-        # 初始化各模块（此处为骨架，实际绑定按环境接入）
-        if self.enable_ns or self.enable_agc:
-            try:
-                from webrtc_noise_gain import AudioProcessing
-                self.ap = AudioProcessing()
-            except ImportError:
-                self.ap = None
         if self.enable_vad:
-            import torch
             self.vad_model, self.vad_utils = torch.hub.load(
                 'snakers4/silero-vad', 'silero_vad', trust_repo=True)
             self.get_ts = self.vad_utils[0]
@@ -110,55 +110,70 @@ class SpeechFrontend:
     def process(self, mic: np.ndarray, far: np.ndarray = None):
         """
         mic: 麦克风信号; far: 远端参考（AEC 用，可空）。
-        返回增强后波形与语音段。
+        返回 (增强后波形, 语音段时间戳列表)。
         """
-        x = mic.copy()
+        x = mic.astype(np.float32).copy()
 
-        # 1. AEC（需要远端参考）
+        # 1. AEC（需要远端参考；接入第 3 周的 nlms_aec 或自编译的 AEC3 绑定）
         if self.enable_aec and far is not None:
-            # x = aec(x, far)   # 接入第 3 周的 NLMS 或 WebRTC AEC3
+            # from week3 import nlms_aec
+            # x, _ = nlms_aec(x, far, L=int(0.15 * self.sr), freeze=True)
             pass
 
-        # 2. NS（此处以占位示意；接 DeepFilterNet 或 WebRTC NS）
-        if self.enable_ns:
-            # x = deepfilternet_enhance(x) 或 webrtc NS
-            pass
+        # 2+3. NS + AGC（webrtc-noise-gain：一次实例同时做两件事，按开关配置档位）
+        if self.enable_ns or self.enable_agc:
+            from webrtc_noise_gain import AudioProcessor
+            auto_gain = 15 if self.enable_agc else 0     # 0=关闭；[0,31] dBFS
+            ns_level = 2 if self.enable_ns else 0        # 0=关闭；[0,4]
+            ap = AudioProcessor(auto_gain, ns_level)
+            x_i16 = np.clip(x * 32768, -32768, 32767).astype(np.int16)
+            out = []
+            for j in range(0, len(x_i16) - 159, 160):    # 每次处理 10 ms（不足 10 ms 的尾部丢弃）
+                chunk = ap.Process10ms(x_i16[j:j+160].tobytes())
+                out.append(np.frombuffer(chunk.audio, dtype=np.int16))
+            x = np.concatenate(out).astype(np.float32) / 32768.0
 
-        # 3. AGC
-        if self.enable_agc:
-            x = self._agc(x)
-
-        # 4. VAD：返回语音段
+        # 4. VAD：返回语音段（放链尾，享受前面所有处理的红利）
         segments = None
         if self.enable_vad:
-            import torch
             segments = self.get_ts(torch.from_numpy(x).float(),
                                    self.vad_model, sampling_rate=self.sr)
         return x, segments
 
-    def _agc(self, x):
-        # 简化版：峰值归一化到目标电平（生产用第 4 周的完整 AGC）
-        target = 0.3
-        peak = np.abs(x).max() + 1e-8
-        return x / peak * target if peak > target else x
+    def keep_speech(self, x: np.ndarray, segments) -> np.ndarray:
+        """按 VAD 时间戳拼接语音段（无语音时返回空数组）。"""
+        if not segments:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate([x[t['start']:t['end']] for t in segments])
 ```
 
-**注意**：上面 NS/AEC 是接入点占位——把你第 2 周的 DeepFilterNet、第 3 周的 AEC 接进去。这个类的价值在于**统一编排 + 可开关消融**。
+**注意**：
+- `AudioProcessor(auto_gain, ns_level)` 的两个参数控制 NS/AGC 的档位，把 `0` 传给任一项即关闭它——这正是消融实验需要的"逐模块开关"；
+- AEC 是唯一的占位接入点（Python 生态暂无维护良好的 AEC3 绑定，见 2.3 节）——把第 3 周的 `nlms_aec` 接进去即可闭环。这个类的价值在于**统一编排 + 可开关消融**。
 
 ### 3.2 端到端：前端 + ASR
 
 ```python
+import tempfile
+import soundfile as sf
 from funasr import AutoModel
 
 class FrontendASR:
     def __init__(self):
         self.frontend = SpeechFrontend()
+        # SenseVoiceSmall：多语言 ASR，CPU 可跑，首次运行自动下载权重
         self.asr = AutoModel(model="iic/SenseVoiceSmall")
 
     def transcribe(self, mic, far=None):
         enhanced, segments = self.frontend.process(mic, far)
-        # 只把语音段喂给 ASR（VAD 的价值）
-        res = self.asr.generate(input=enhanced)
+        # 只把语音段喂给 ASR（VAD 的价值：跳过静音/噪声段）
+        speech = self.frontend.keep_speech(enhanced, segments)
+        if len(speech) == 0:
+            return ""
+        # FunASR 对数组输入的支持随版本变化，写临时 wav 最稳
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            sf.write(f.name, speech, self.frontend.sr)
+            res = self.asr.generate(input=f.name)
         return res[0]["text"]
 ```
 
@@ -253,7 +268,7 @@ for name, cfg in configs.items():
 **A**：过度降噪引入音乐噪声/频谱失真，AGC 放大残留噪声，这些伪影破坏 ASR 特征。激进档的失真代价超过了去噪收益。需消融找到每级的最优强度。
 
 **Q4**：实时通信场景，前端延迟怎么控制？
-**A**：每级用因果、短帧设计；AEC/NS 用流式模型（如 DeepFilterNet 20ms 帧）；避免需要长上下文的非因果处理。总算法延迟控制在几十毫秒内。
+**A**：每级用因果、短帧设计；AEC/NS 用流式模型（如 DeepFilterNet：20 ms 帧 + 20 ms 前瞻，总延迟 40 ms）；避免需要长上下文的非因果处理。总算法延迟控制在几十毫秒内。
 
 **Q5**：你的前端如何与 Stage 7 的端侧助手对接？
 **A**：前端（AEC+NS+AGC+VAD）作为助手的麦克风输入预处理，输出干净语音段喂端侧 ASR（SenseVoice-Small）。前端质量直接决定 ASR 上限，是助手可用性的关键一环。

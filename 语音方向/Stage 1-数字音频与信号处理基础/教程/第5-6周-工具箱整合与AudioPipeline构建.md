@@ -33,7 +33,7 @@ import torchaudio
 # 读取（返回 (channels, samples) 与采样率）
 wave, sr = torchaudio.load("sample.wav")        # (C, N)
 
-# 重采样（生产级，多相滤波）
+# 重采样（生产级，带限 sinc 插值，Kaiser 窗核）
 wave = torchaudio.functional.resample(wave, sr, 16000)
 
 # Kaldi 风格 Fbank（ASR 训练标配，与 ESPnet/FunASR 对齐）
@@ -48,7 +48,9 @@ mel_transform = torchaudio.transforms.MelSpectrogram(
 mel = mel_transform(wave)                       # (C, 80, T)
 ```
 
-**`compliance.kaldi.fbank` vs `MelSpectrogram` 的区别**（面试高频）：前者严格复现 Kaldi 的特征提取（能量归一化、dither、预加重等细节），是 FunASR/ESPnet 系 ASR 的标准输入；后者是通用的可微 Mel 谱，常用于 TTS/声码器。**喂 ASR 用前者，做声学分析用后者**——混用是精度玄学的常见来源。
+> **版本兼容提示**：torchaudio 2.9 起把音频读写的后端移交给了 TorchCodec——若你装的是新版 torchaudio，`torchaudio.load/save` 需要 `pip install torchcodec`（或改用 `soundfile` 读入后转张量）。`compliance.kaldi.fbank`、`transforms` 等特征提取 API 不受影响。
+
+**`compliance.kaldi.fbank` vs `MelSpectrogram` 的区别**（面试高频）：前者严格复现 Kaldi 的特征提取（dither、预加重、去直流等细节，默认 `use_power=True` + 取对数），是 FunASR/ESPnet 系 ASR 的标准输入；后者是通用的可微 Mel 谱（默认 `power=2.0`、不取对数），常用于 TTS/声码器。**喂 ASR 用前者，做声学分析用后者**——混用是精度玄学的常见来源。
 
 ---
 
@@ -104,8 +106,9 @@ assert (out.sum(dim=1) == 0).any() or (out.sum(dim=0) == 0).any()
 
 **关键工程细节**：
 - **只在训练时开**：推理/验证必须关闭，否则引入随机性破坏可复现性；
-- 参数 $F, T$ 的上限（如 `freq_mask_param=27`）来自原论文在 LibriSpeech 的配置，中文/长音频可按比例调整；
-- 掩码置 0 等价于"把该区域当静音"，与 CMVN 归一化配合时注意：应在归一化**之后**做掩码（置 0 才代表"无信息"）。
+- 上面的默认参数（$F=27$、$T=100$、各 2 条掩码）正是原论文在 LibriSpeech 上的 **LD（Double）策略**；中文/长音频可按比例调整；
+- torchaudio 也内置了 `transforms.FrequencyMasking` / `TimeMasking`，参数语义相同，生产中可直接用；
+- 掩码置 0 等价于"把该区域当静音"，与 CMVN 归一化配合时注意：应在归一化**之后**做掩码（先掩码会把 0 也统计进均值/方差，扭曲归一化参数）。
 
 ---
 
@@ -131,18 +134,21 @@ import torch.nn.functional as F
 
 def apply_reverb(speech: torch.Tensor, rir: torch.Tensor) -> torch.Tensor:
     """speech: (1, N); rir: (1, M)。返回带混响信号并归一化。"""
-    # 用 FFT 卷积加速（长信号）
-    y = F.conv1d(speech.unsqueeze(0).flip(-1), rir.unsqueeze(0).flip(-1))
-    y = y.squeeze(0).flip(-1)[:speech.shape[-1]]
+    M = rir.shape[-1]
+    # 注意：torch.conv1d 实际算的是"互相关"，不是数学卷积。
+    # 把核翻转就变成真卷积；左侧补 M-1 个零是为了对齐时刻、保住前 M-1 个瞬态样本。
+    y = F.conv1d(F.pad(speech, (M - 1, 0)), rir.flip(-1))   # (1, N)
     peak = y.abs().max() + 1e-8
     return y / peak * speech.abs().max()   # 峰值对齐防削波
 ```
+
+> **动手验证**：`apply_reverb` 的卷积部分（归一化前）应与 `np.convolve(speech.numpy()[0], rir.numpy()[0])[:N]` 逐点一致（float32 下误差 $10^{-7}$ 量级）——这正是验证"互相关 vs 卷积"坑的最佳练习。
 
 RIR 数据源：OpenAIR、MIT IR Survey，或用 `pyroomacoustics` 数值模拟任意房间。
 
 ### 3.3 变速与变调
 
-- **变速（speed perturb）**：改变时长但**不改音高**（如 0.9×/1.1×）——`torchaudio` 无直接支持，用 `sox` 或 `librosa.effects.time_stretch`；
+- **变速（speed perturb）**：改变时长但**不改音高**（如 0.9×/1.1×）——torchaudio 没有开箱即用的 API（旧版的 `sox_effects` 后端已在 2.9 中移除），常用 `sox` 命令行或 `librosa.effects.time_stretch(y, rate=...)`；
 - **变调（pitch shift）**：改音高不改时长——模拟不同说话人。
 
 Kaldi 经典配方是 **0.9/1.0/1.1 三档变速**，等价于数据量 ×3。
@@ -259,7 +265,8 @@ for i, p in enumerate(paths):
     assert wave.dim() == 2 and wave.shape[0] == 1
     assert fbank.shape[1] == 80
     expected_T = 1 + (wave.shape[-1] - 400) // 160
-    assert abs(fbank.shape[0] - expected_T) <= 2   # 中心填充±1帧容差
+    # kaldi fbank 默认 snip_edges=True（不中心填充），帧数严格等于上式
+    assert abs(fbank.shape[0] - expected_T) <= 2   # 留容差防不同实现边界差异
 
     # 保存可视化（波形 + fbank 热力图）
     fig, axes = plt.subplots(2, 1, figsize=(12, 6))
@@ -274,7 +281,7 @@ for i, p in enumerate(paths):
 print("全部跑通，可视化已保存。")
 ```
 
-**预期**：每条音频打印三个 shape，fbank 帧数与公式 $1 + (N-400)/160$ 吻合（±1 容差），并输出波形 + 语谱图可视化。
+**预期**：每条音频打印三个 shape，fbank 帧数与公式 $1 + (N-400)/160$ 严格吻合，并输出波形 + 语谱图可视化。
 
 **验证增广生效**：同一路径分别用 `use_specaugment=True/False` 各跑一次，断言两次 `fbank` 不完全相同（掩码引入差异），证明增广链路接通。
 
@@ -322,8 +329,8 @@ print(res[0]["text"])
 **Q2**：为什么喂 ASR 用 `compliance.kaldi.fbank` 而不用通用 `MelSpectrogram`？
 **A**：Kaldi fbank 严格复现训练该模型时的特征规范（能量、dither、预加重），保证输入分布一致；通用 Mel 谱细节不同，会引入分布漂移。特征提取必须与模型训练配置逐项对齐。
 
-**Q3**：`AudioPipeline` 的帧数断言为什么留 ±1 容差？
-**A**：不同实现的中心填充/边界处理可能差一帧；断言目标是抓"量级错误"（如采样率错导致帧数差几倍），而非纠结一帧的边界差异。
+**Q3**：`AudioPipeline` 的帧数断言为什么留 ±2 容差？
+**A**：`compliance.kaldi.fbank` 默认 `snip_edges=True`（不中心填充），帧数严格等于 $1 + (N-400)/160$；但其他实现（如 `MelSpectrogram` 的 `center=True`）会中心填充、多出几帧。容差是为了在混用实现时仍能抓住"量级错误"（如采样率错导致帧数差几倍），而不是纠结边界上的一两帧。
 
 **Q4**：在线增广和离线预生成增广，各自适合什么场景？
 **A**：在线增广多样性好、存储省，适合训练主流程；离线预生成速度快、可复现，适合把昂贵的增广（如混响卷积）固化成数据集。常见组合：昂贵增广离线、轻量增广在线。

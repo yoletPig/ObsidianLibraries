@@ -18,25 +18,29 @@ Whisper 之前的 ASR 是"窄而精"：在干净、标注严格的域内数据�
 
 ### 1.2 Whisper 的答案
 
-OpenAI 收集了 **68 万小时**的多语言、带字幕互联网音频（弱监督：字幕不精确、有噪声），不做精细清洗，而是用足够大的模型硬吃这些数据。核心洞察：
+OpenAI 收集了 **68 万小时**的多语言、带字幕互联网音频（弱监督：字幕不精确、有噪声；论文为 [Radford et al., 2022, arXiv:2212.04356](https://arxiv.org/abs/2212.04356)），不做精细清洗，而是用足够大的模型硬吃这些数据。核心洞察：
 
 $$
 \text{数据多样性} \times \text{数据规模} \;\gg\; \text{标注精度}
 $$
 
+**这个式子在说什么**：它不是数学等式，而是一句工程判断——对鲁棒性而言，数据的覆盖面（口音、噪声、领域）和总量，比每条标注的精确度重要得多。Whisper 团队有意放弃"清洗到 LibriSpeech 那么干净"，换来的是换域不崩。后缀事实：后续的 large-v3（2023-11 发布）更是用 100 万小时弱标注 + 400 万小时伪标注（用 large-v2 打的标签）继续验证这条路线。
+
 结果是一个对噪声、口音、领域都**鲁棒**的通用模型。这个"数据工程优先于模型精巧"的思路，与 VLM 时代的大规模弱监督预训练一脉相承。
 
 ### 1.3 多任务统一：用特殊 token 编程
 
-Whisper 不用多个模型，而是用**任务控制 token** 在解码起始处指定行为：
+Whisper 不用多个模型，而是用**任务控制 token** 在解码起始处指定行为。解码总是从 `<|startoftranscript|>` 开始，随后依次给出：
 
 $$
-\langle|\text{zh}|\rangle \;\langle|\text{transcribe}|\rangle \;\langle|\text{notimestamps}|\rangle \;\to\; \text{文字}
+\langle|\text{startoftranscript}|\rangle \;\langle|\text{zh}|\rangle \;\langle|\text{transcribe}|\rangle \;\langle|\text{notimestamps}|\rangle \;\to\; \text{文字}
 $$
 
-- 语言标签（99 种）→ 控制输出语言；
-- `transcribe` vs `translate` → 转写还是翻译成英文；
-- 时间戳开关 → 是否输出 `<|0.00|>` 形式的时间戳。
+**这行式子在干什么**：它是给解码器的"程序指令行"。Decoder 是自回归的，每一步都在预测下一个 token——把语言、任务、时间戳开关做成词表里的特殊 token，等于让"输出什么"变成生成序列的一部分，模型自己"读"到 `<|transcribe|>` 就走转写分支，读到 `<|translate|>` 就走翻译分支：
+
+- `<|en|>` `<|zh|>` 等语言标签（99 种）→ 控制输出语言；
+- `<|transcribe|>` vs `<|translate|>` → 转写原语言，还是翻译成英文；
+- `<|notimestamps|>` 或省略它 → 是否输出 `<|0.00|>` 形式的时间戳 token。
 
 一个模型、多种行为，全靠前缀 token 条件化——这就是"用 token 编程"。
 
@@ -56,21 +60,25 @@ $$
 
 - 输入固定 **30 秒**（不足补零，超过切段）；
 - 16 kHz × 30 s = 480000 样本；
-- 25 ms 窗、10 ms 移、n_fft=400 的 80 维 Log-Mel → $(80, 3000)$（3000 帧）。
+- 25 ms 窗、10 ms 移（win_length=400、hop_length=160、n_fft=400）的 80 维 Log-Mel → $(80, 3000)$。
+
+**Shape 怎么来的**：帧数 = $480000 / 160 = 3000$——特征提取器把"每 10 ms 一帧"拍平成除法；$80$ 是 Mel 滤波器组个数（第 1 周 Stage 1 的 Mel 频谱知识在此落地）。tiny 到 medium 都用 80 维；**large-v3 改用 128 维**，这是 v2→v3 少数的输入侧改动。所以完整的输入 shape 是 $(1, 80, 3000)$（batch=1），这就是官方 `WhisperFeatureExtractor` 输出的形状。
 
 ### 2.3 CNN 下采样 2×：(80, 3000) → (1500, d)
 
-两个步长 2 的卷积（第一层步长 1、第二层步长 2，整体时间维减半）+ GELU：
+两层一维卷积 + GELU：**第一层步长 1（kernel 3），第二层步长 2（kernel 3）**，整体时间维减半：
 
 $$
-(80, 3000) \xrightarrow{\text{Conv}} (1500, d_{\text{model}})
+(80, 3000) \xrightarrow{\text{Conv1, stride 1}} (d_{\text{model}}, 3000) \xrightarrow{\text{Conv2, stride 2}} (1500, d_{\text{model}})
 $$
 
-$d_{\text{model}}$ 随尺寸变化（small=768, large=1280）。加上可学习的**位置编码**后送入 Encoder。
+**这两层卷积在干什么**：Transformer 的注意力是 $O(L^2)$ 的，3000 长度太贵；先用步长 2 的卷积把时间维砍半（3000→1500），同时把 80 维 Mel 通道混合升维到 $d_{\text{model}}$——相当于"免费"的一层局部特征提取（类比 Stage 1 学过的滤波器组+降采样）。$d_{\text{model}}$ 随尺寸变化（small=768, large=1280）。
+
+随后加上**正弦（sinusoidal）位置编码**送入 Encoder——注意这是固定公式生成的正弦表，**不是可学习参数**（官方 `whisper/model.py` 中 Encoder 的 `positional_embedding` 是注册的 buffer；可学习位置编码在 Decoder 那一侧，易混淆，面试常考）。
 
 ### 2.4 Encoder 与 Decoder
 
-- **Encoder**：标准 Transformer 块（Pre-LN），输出 $(1500, d)$；
+- **Encoder**：标准 Transformer 块（Pre-LN 前置层归一化 + 末端 LayerNorm），输出 $(1500, d)$；
 - **Decoder**：自回归生成，通过 **cross-attention 看 Encoder 输出**，自注意力带 **KV cache**。
 
 **Shape 链小结**（以 small 为例，$d=768$）：
@@ -102,6 +110,9 @@ model = WhisperForConditionalGeneration.from_pretrained(MODEL).to(device)
 model.eval()
 
 # ---- 1. 载入音频（16 kHz 单声道，≤30s）----
+# librosa.ex("trumpet") 是 librosa 自带示例（音乐，需联网下载），
+# 这里只用于验证 Shape 与推理链路——音乐没有中文语音，识别文本本身无意义。
+# 想测真实效果，把路径换成你自己的 16 kHz 中文录音。
 import librosa
 wave, sr = librosa.load(librosa.ex("trumpet"), sr=16000)
 wave = wave[:16000 * 30]
@@ -145,10 +156,11 @@ for step in range(220):                    # 最大解码步数
     logits, past_kv = generate_step(input_ids, past_kv, enc_hidden)
     next_logits = logits[:, -1, :]         # 取最后位置
     # 强制特殊 token（前几步按语言/任务约束）
-    for token_id, value in forced_decoder_ids:
-        if step + 1 == token_id:
+    # forced_decoder_ids 是 (位置, token_id) 列表，位置从 1 开始计数
+    for pos, tid in forced_decoder_ids:
+        if step + 1 == pos:                # 第 step 个新 token 处在位置 step+1
             next_logits = torch.full_like(next_logits, -float("inf"))
-            next_logits[0, value] = 0
+            next_logits[0, tid] = 0
     next_id = int(next_logits.argmax(-1))
     gen_ids.append(next_id)
     if next_id == model.config.eos_token_id:
@@ -170,8 +182,9 @@ print("识别结果:", text)
 
 ```python
 # 官方 generate 作参照
-ref = model.generate(mel,
-                     forced_decoder_ids=forced_decoder_ids)
+# （新版 transformers 推荐直接传 language/task；上面那种
+#   forced_decoder_ids 写法仍然有效，但会提示弃用警告）
+ref = model.generate(mel, language="zh", task="transcribe")
 ref_text = processor.batch_decode(ref, skip_special_tokens=True)[0]
 print("官方结果:", ref_text)
 print("手写结果:", text)
@@ -193,21 +206,25 @@ rtf = cpu_time / (len(wave) / 16000)
 print(f"CPU 推理耗时 {cpu_time:.2f}s, RTF = {rtf:.2f}")
 ```
 
-预期：CPU 上 small 模型 RTF 通常在 0.3–2 之间（视硬件）。云 GPU 上会降到 0.05 以下。**记录这个对比**——它是你理解"为什么端侧要换非自回归"的定量依据：AR 模型在弱算力上太慢。
+预期：CPU 上 small 模型 RTF 通常在 0.3–3 量级（强依赖 CPU 型号、线程数与 PyTorch 版本，**务必以自己实测为准**）。云 GPU 上可降到 0.05 以下。**记录这个对比**——它是你理解"为什么端侧要换非自回归"的定量依据：AR 模型在弱算力上太慢。
 
 ---
 
 ## 4. 尺寸谱系与部署边界
 
-| 模型 | 参数量 | Encoder 层/宽 | 典型场景 |
-| --- | --- | --- | --- |
-| tiny | 39 M | 4 / 384 | 极端端侧、唤醒级 |
-| base | 74 M | 6 / 512 | 轻量端侧 |
-| small | 244 M | 12 / 768 | 端侧/边缘（本教程用） |
-| medium | 769 M | 24 / 1024 | 云端高质量 |
-| large-v3 | 1.55 B | 32 / 1280 | 云端最高精度 |
+| 模型 | 参数量 | Mel 维 | Encoder 层/宽 | 典型场景 |
+| --- | --- | --- | --- | --- |
+| tiny | 39 M | 80 | 4 / 384 | 极端端侧、唤醒级 |
+| base | 74 M | 80 | 6 / 512 | 轻量端侧 |
+| small | 244 M | 80 | 12 / 768 | 端侧/边缘（本教程用） |
+| medium | 769 M | 80 | 24 / 1024 | 云端高质量 |
+| large-v3 | 1550 M | **128** | 32 / 1280 | 云端最高精度 |
 
-**部署边界经验**：端侧 NPU/CPU 通常止于 small；medium 以上需要 GPU。这也解释了你的结课项目为何选 SenseVoice-Small（NAR，端侧友好）而非 Whisper-medium。
+（参数量与层数/宽度出自 Whisper 论文 [Radford et al., 2022] Table 及 [large-v3 模型卡](https://huggingface.co/openai/whisper-large-v3)。）
+
+**large-v3（2023-11 发布）相对 large-v2 的三处变化**：① Mel 特征从 80 维换成 128 维；② 词表新增粤语（Cantonese）语言 token；③ 训练数据扩充到 100 万小时弱标注 + 400 万小时伪标注（large-v2 打标）。语言仍为 99 种。若你用 large-v3，`processor` 会自动用 128 维特征，**但自研前端代码要相应改 `n_mels`**——这是迁移时最常踩的坑。
+
+**部署边界经验**：端侧 NPU/CPU 通常止于 small；medium 以上需要 GPU（2024-10 的 large-v3-turbo 把 decoder 从 32 层砍到 4 层、参数量降到 809M，是云端兼顾速度的新选择）。这也解释了你的结课项目为何选 SenseVoice-Small（NAR，端侧友好）而非 Whisper-medium。
 
 ---
 
@@ -225,7 +242,7 @@ Whisper 单次只吃 30 秒。长音频需：
 ### 5.2 解码策略
 
 - **贪心**：快，端侧用；
-- **beam search**（默认 5）：更稳，云端用；
+- **beam search**：官方 CLI 默认 `beam_size=5`（且仅在温度为 0 时启用；`transformers` 的 `generate` 默认贪心，需手动传 `num_beams`），更稳，云端用；
 - **温度回退**：置信度低时升温重试，抑制幻觉。
 
 ### 5.3 时间戳头

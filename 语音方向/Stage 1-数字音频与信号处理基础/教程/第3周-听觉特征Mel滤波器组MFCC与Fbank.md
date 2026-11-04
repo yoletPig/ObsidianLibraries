@@ -23,11 +23,15 @@
 
 ### 1.2 Mel 刻度
 
-Mel 刻度由心理声学实验定义：1000 mel 被定义为 40 dB、1 kHz 纯音的音高感知，其余频率按"听起来几倍高/低"的主观判断标定。广泛使用的近似换算（O'Shaughnessy 公式）：
+Mel 刻度由心理声学实验定义：1000 mel 被定义为 40 dB、1 kHz 纯音的音高感知，其余频率按"听起来几倍高/低"的主观判断标定。广泛使用的近似换算（O'Shaughnessy 公式，也是 HTK 工具包采用的公式）：
+
+**这个公式在干什么**：把"物理频率 $f$（Hz）"翻译成"人耳觉得它有多高（mel）"。同一把尺子换了个刻度——0 到 8000 Hz 在 mel 轴上不再均匀，低频被拉长、高频被压缩。
 
 $$
 m = 2595 \cdot \log_{10}\!\left(1 + \frac{f}{700}\right)
 $$
+
+逐符号读：$f$ 是输入频率（Hz），$m$ 是输出感知音高（mel），常数 2595 与 700 是让 $f=1000$ Hz 恰好对应 $m=1000$ mel 的标定值。分母的 700 决定"线性段与对数段的转折位置"。
 
 逆变换：
 
@@ -37,7 +41,9 @@ $$
 
 **性质**：低频段近似线性（$f \ll 700$ 时 $m \approx 2595 f/700$），高频段近似对数压缩。直觉：低频精细、高频粗糙——正好匹配耳蜗的频率分辨特性。
 
-（现代变体：HTK mel 与 Slaney mel 的差异只在归一化，`librosa` 用 `htk=True/False` 切换；Whisper 用的是自己的 80 维滤波器组，思路一致。）
+> **动手验证**：$f=1000$ Hz → $m = 2595\log_{10}(1+1000/700) \approx 1000$ mel；$f = 8000$ Hz → $m \approx 2840$ mel。也就是说 0–1 kHz 占了 mel 轴的 1/3 左右——低频在感知世界里"地盘"大得多。
+
+（常见变体：上式即 **HTK mel**（HTK 手册写作 $1127\ln(1+f/700)$，与 $2595\log_{10}$ 数学等价）；**Slaney mel** 则是分段线性近似——1 kHz 以下纯线性、以上对数，两者数值不同。`librosa` 默认用 Slaney（`htk=False`），传 `htk=True` 切换到上式；Whisper 用的是自己的 80 维滤波器组，思路一致。）
 
 ### 1.3 从刻度到滤波器组
 
@@ -51,6 +57,8 @@ $$
 
 **第 $i$ 个三角滤波器的响应**：
 
+**这个公式在干什么**：给第 $i$ 个"听觉频带"造一顶三角形帐篷——中心点权重 1，向两边线性滑落到 0。之后用它在频率轴上"扫"一遍：落在帐篷正下方的频率成分全额计入，边缘的按比例打折。注意这里的 $k$ 是 FFT bin（离散下标），$f_{i-1}, f_i, f_{i+1}$ 是三个边界点的 bin 位置（可为浮点，见 3.1 代码）。
+
 $$
 H_i[k] =
 \begin{cases}
@@ -61,9 +69,13 @@ H_i[k] =
 \end{cases}
 $$
 
+读法：上升沿 $(k - f_{i-1})/(f_i - f_{i-1})$ 是"我从左脚走到中点走了几成"，下降沿 $(f_{i+1} - k)/(f_{i+1} - f_i)$ 是"从中点到右脚还剩几成"——两段各自把 0→1、1→0 线性走完，就拼出一顶帐篷。
+
 **关键直觉**：滤波器组矩阵 $\mathbf{H} \in \mathbb{R}^{B \times (N/2+1)}$ 是一个**稀疏的带权池化**——把 257 个线性频率 bin 加权平均成 80 个"听觉频带"。低频区滤波器窄（保留细节），高频区滤波器宽（主动丢弃细节）。这一步把特征维度从 257 压到 80，同时把信息按"耳朵关心程度"重新分配。
 
 ### 1.4 Log-Mel 特征的计算链
+
+**这一串变换在干什么**：把第 2 周输出的 257 维线性频谱，先"平方"成能量（功率谱），再用 80 顶三角帐篷加权求和（人耳频带池化），最后取对数（模拟响度感知）。三步之后得到的就是 ASR 最常用的 Fbank 特征。
 
 $$
 \underbrace{|X[m,k]|^2}_{\text{功率谱}}
@@ -113,7 +125,7 @@ DCT（离散余弦变换）在这里的作用：log-mel 相邻维度高度相关
 | Whisper | 80 | 16 kHz | 25 ms / 10 ms, n_fft=400 | 自定义滤波器组 |
 | SenseVoice | 80 | 16 kHz | 25 ms / 10 ms | fbank，CMVN 归一化 |
 | Paraformer | 80 | 16 kHz | 25 ms / 10 ms | Kaldi 风格 compliance fbank |
-| CosyVoice TTS | 50 | 24 kHz | — | 语音合成侧常用更少维度 |
+| CosyVoice TTS | 80 | 24 kHz | n_fft=1920, hop=480 | matcha 风格 mel，fmax=12 kHz |
 | HiFi-GAN（声码器） | 80/100 | 22/24 kHz | — | 输入是 mel，输出波形 |
 
 记住这个模式：**ASR ≈ 80 维 @16 kHz，TTS ≈ 80-100 维 @22-24 kHz**。
@@ -176,10 +188,10 @@ assert width_high > width_low * 2, "高频滤波器应明显更宽"
 
 ```
 滤波器组 shape: (80, 257)
-第 1 个滤波器支撑 6 bins，第 80 个支撑 57 bins
+第 1 个滤波器支撑 1 bins，第 80 个支撑 17 bins
 ```
 
-最后一行断言是 Mel 刻度"低频细、高频粗"的直接可视化证据。画出来更直观：
+（具体 bins 数随实现细节略有浮动，量级关系不会变。）最后一行断言是 Mel 刻度"低频细、高频粗"的直接可视化证据：换算成 Hz，第 1 个滤波器只覆盖约 44 Hz（0–44 Hz），第 80 个要覆盖约 520 Hz（7.5–8 kHz）——高频带比低频带宽一个数量级。画出来更直观：
 
 ```python
 import matplotlib
@@ -227,22 +239,24 @@ assert feat.shape == (expected_T, 80), f"期望 ({expected_T}, 80)，实际 {fea
 ```python
 import librosa
 
+# 关键：librosa 默认 htk=False（Slaney mel 刻度）+ norm='slaney'（等面积归一化），
+# 与我们手写的"HTK 公式 + 不归一化"约定都不同，必须显式对齐：
 S_lib = librosa.feature.melspectrogram(
     y=x, sr=16000, n_fft=512, hop_length=160, win_length=400,
-    n_mels=80, fmin=0, fmax=8000, power=2.0, htk=False)
-log_lib = np.log(S_lib + 1e-5)
+    n_mels=80, fmin=0, fmax=8000, power=2.0, htk=True, norm=None)
+log_lib = np.log(S_lib.T + 1e-5)     # librosa 输出 (n_mels, T)，转置后对齐
 
 err = np.max(np.abs(feat - log_lib))
-print(f"手写版与 librosa 最大差异: {err:.4f}")
+print(f"手写版与 librosa 最大差异: {err:.2e}")
 ```
 
-**预期**：差异通常在 $0.01$ 以内。若有系统偏差，按此排查清单（按出现频率排序）：
+**预期**：两侧约定一致后，差异在 $10^{-6}$ 量级（输入 float32 的存储精度所致；若把 `x` 转成 float64 再算，可到 $10^{-8}$ 以下）。若有明显系统偏差，按此排查清单（按出现频率排序）：
 
-1. **滤波器归一化方式**：`librosa` 默认 `norm=None`，但部分实现用"等面积归一化"（Slaney，除以滤波器带宽）；
-2. **$\epsilon$ 取值**：`librosa.power_to_db` 内部参考值不同；
-3. **幅度谱还是功率谱**：差一个平方；
-4. **窗函数**：Hann 必须一致；
-5. **htk 开关**：mel 换算公式不同。
+1. **htk 开关**：`librosa` 默认 `htk=False`，用 Slaney 分段线性 mel 刻度（1 kHz 以下线性、以上对数），与本教程的 $2595\log_{10}$（HTK）公式数值不同；
+2. **滤波器归一化方式**：`librosa` 默认 `norm='slaney'`（等面积归一化，权重除以滤波器带宽），手写版未归一化，对齐时需显式传 `norm=None`；
+3. **$\epsilon$ 取值**：`librosa.power_to_db` 内部用 `amin=1e-10` 与 top_db 截断，直接 `np.log` 则不含这些；
+4. **幅度谱还是功率谱**：差一个平方（`power=1` vs `power=2`）；
+5. **窗函数**：Hann 必须一致（注意对称窗与周期窗之别，见第 2 周）。
 
 能逐条说出差异来源，说明你真的懂了这条链路——这也是面试常考题。
 
@@ -252,7 +266,7 @@ print(f"手写版与 librosa 最大差异: {err:.4f}")
 
 ### 4.1 为什么需要
 
-同一句话在不同麦克风/电话信道下，频谱会被整体染色（乘性失真）→ log 域变成加性偏移。CMVN（Cepstral Mean and Variance Normalization）对每个特征维度做标准化：
+同一句话在不同麦克风/电话信道下，频谱会被整体染色（乘性失真）→ log 域变成加性偏移。CMVN（Cepstral Mean and Variance Normalization，倒谱均值方差归一化）对每个特征维度做标准化——**这个公式在干什么**：对每一维 $i$，减去它整句的平均值 $\mu_i$（消掉信道加的"直流偏移"），再除以标准差 $\sigma_i$（把各维拉到相同幅度尺度），输出变成均值 0、方差 1 的分布。
 
 $$
 \hat{z}_{t,i} = \frac{z_{t,i} - \mu_i}{\sigma_i}

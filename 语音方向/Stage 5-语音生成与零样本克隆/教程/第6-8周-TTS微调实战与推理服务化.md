@@ -5,7 +5,7 @@
 > 2. CosyVoice SFT / GPT-SoVITS 微调 / F5-TTS LoRA 三条微调路线怎么选？
 > 3. 流式 TTS 服务如何压测？并发 10 路时 RTF 与延迟怎么变？
 
-对应学习计划：第 6-8 周。交付物：① 录制/准备 ≥30 分钟干声，完成一次 TTS 微调；② 盲评微调前后的说话人相似度 + 合成语音喂 ASR 测可懂度（WER）；③ FastAPI 流式服务 + 并发压测。
+对应学习计划：第 6-8 周。交付物：① 录制/准备 ≥30 分钟干声，完成一次 TTS 微调；② 盲评微调前后的说话人相似度 + 合成语音喂 ASR 测可懂度（WER/CER）；③ FastAPI 流式服务 + 并发压测。
 
 ---
 
@@ -30,17 +30,29 @@ $$
 4. **质量过滤**：去掉转写置信度低、时长异常、能量异常的样本。
 
 ```python
-# 用 SenseVoice 自动转写（复用 Stage 2）
+# 用 SenseVoice 自动转写（复用 Stage 2）——教学骨架，glob/duration 等按你的 Stage 2 工具补齐
+import glob
+import soundfile as sf
 from funasr import AutoModel
-asr = AutoModel(model="iic/SenseVoiceSmall")
+
+asr = AutoModel(model="iic/SenseVoiceSmall")   # ModelScope 上的 SenseVoiceSmall
+
+def clean_label(text: str) -> str:
+    # SenseVoice 输出形如 <|zh|><|NEUTRAL|><|Speech|>文本
+    for tag in ("<|zh|>", "<|en|>", "<|yue|>", "<|ja|>", "<|ko|>",
+                "<|NEUTRAL|>", "<|Speech|>", "<|BGM|>", "<|Noise|>", "<|Emb|>"):
+        text = text.replace(tag, "")
+    return text.strip()
 
 def transcribe_corpus(wav_dir):
     samples = []
-    for wav in sorted(glob(f"{wav_dir}/*.wav")):
-        res = asr.generate(input=wav)
+    for wav_path in sorted(glob.glob(f"{wav_dir}/*.wav")):
+        x, sr = sf.read(wav_path, dtype="float32")
+        res = asr.generate(input=wav_path)
         text = clean_label(res[0]["text"])    # 去掉 <|zh|> 等特殊标签
-        if 0.5 < duration(wav) < 15 and len(text) > 2:
-            samples.append({"audio": wav, "text": text})
+        dur = len(x) / sr
+        if 0.5 < dur < 15 and len(text) > 2:
+            samples.append({"audio": wav_path, "text": text})
     return samples
 ```
 
@@ -51,7 +63,7 @@ def transcribe_corpus(wav_dir):
 | 数据量 | 可达效果 | 适用路线 |
 | --- | --- | --- |
 | 5 秒 - 1 分钟 | 零样本/少样本克隆（音色接近） | GPT-SoVITS 零样本、CosyVoice 零样本 |
-| 5 - 30 分钟 | 少样本微调（高贴合） | GPT-SoVITS 微调、F5-TTS LoRA |
+| 5 - 30 分钟 | 少样本微调（高贴合） | GPT-SoVITS 微调、F5-TTS LoRA（F5 建议十几分钟以上） |
 | 30 分钟 - 数小时 | SFT（专业级贴合） | CosyVoice SFT |
 
 ---
@@ -60,37 +72,45 @@ def transcribe_corpus(wav_dir):
 
 ### 2.1 GPT-SoVITS 微调（最低成本）
 
+GPT-SoVITS 的微调是 **WebUI 驱动**的（`python webui.py` 启动，或 Windows 整合包双击 `go-webui.bat`），没有"一条命令微调"的官方 CLI：
+
 ```bash
-# WebUI 流程：
-# 1. 上传 1-5 分钟参考音频 + 转写
-# 2. 一键数据标注（ASR + 对齐）
-# 3. 微调 GPT（语义）与 SoVITS（音色）两个模型
-# 4. 推理测试
+# WebUI 流程（都在 "1-GPT-SoVITS-TTS" 页签里完成）：
+# 1A 训练集格式化工具：上传音频 -> 切片 -> （可选 UVR5 降噪）-> ASR 转写 -> 人工校对转写
+# 1B 微调 SoVITS 模块（音色），1C 微调 GPT 模块（韵律）——两个模块分别训练
+# 1D 推理：填参考音频 + 目标文本即可试听
 ```
 
-**优点**：上手最快、工具链全、几分钟出结果。
-**缺点**：工业化程度低，流式/服务化需自己包。
+**优点**：上手最快、工具链全（切片/降噪/ASR/校对/训练/推理一站化）、低配 GPU 可跑。
+**缺点**：工业化程度低，流式/服务化需自己包（训练产物是 SoVITS 的 `.pth` 与 GPT 的 `.ckpt` 两份权重，要用推理脚本自行封装）。
 
 ### 2.2 CosyVoice SFT（工业级贴合）
 
+CosyVoice 仓库（`CosyVoice-300M-SFT` 系）提供训练示例脚本（`examples/libritts/cosyvoice/run.sh`），把 (音频, 转写) 对格式化后微调出专属音色模型，用 `inference_sft` 调用：
+
 ```python
-# CosyVoice SFT 模式：用格式化数据微调
-# 数据格式：(音频, 转写) 对，几十小时级别
+# 数据格式：(音频路径, 转写) 对，数据量小时级起步更稳
+# 训练流程见仓库 examples/ 目录（基于 run.sh，内部是数据准备 + LLM/flow 分阶段训练）
 # 训练后得到专属音色模型，支持流式推理
 ```
 
-**优点**：工业级、流式、贴合度高。
-**缺点**：需要更大数据量（小时级）与 GPU。
+**优点**：工业级、原生流式、贴合度高。
+**缺点**：需要更大数据量与 GPU、训练链路比 WebUI 复杂。
 
 ### 2.3 F5-TTS LoRA（轻量）
 
+F5-TTS 官方支持对 DiT 骨干做 **LoRA** 微调（`pip install f5-tts` 提供 `f5-tts_finetune-cli` 与 `f5-tts_finetune-gradio` 两个入口）：
+
 ```python
-# 对 F5-TTS 的 DiT 骨干做 LoRA 微调
-# 只需少量数据（5-30 分钟），训练快
-# 保留底模能力，插入目标音色
+# pip install f5-tts 后，官方提供 4 个命令行入口：
+#   f5-tts_infer-cli / f5-tts_infer-gradio      推理
+#   f5-tts_finetune-cli / f5-tts_finetune-gradio 微调（CLI 或 Gradio 界面）
+# 数据格式：(音频, 转写) 对
+# 社区经验：十几分钟音频起步能看到效果，约 1 小时较稳，几小时更好
+# LoRA 只训低秩增量，显存占用低于全参微调
 ```
 
-**优点**：轻量、保留通用能力、可插拔。
+**优点**：轻量、保留底模通用能力、可插拔。
 **缺点**：无原生流式、服务化需自建。
 
 ### 2.4 选型建议
@@ -105,21 +125,21 @@ def transcribe_corpus(wav_dir):
 
 ### 3.1 执行一次微调
 
-以 GPT-SoVITS 为例（最低门槛）：
+以 GPT-SoVITS 为例（最低门槛）。注意：**GPT-SoVITS 没有 `webui.py finetune` 这类子命令**——所有数据处理与训练都在 WebUI 页签里点击完成：
 
 ```bash
-# 1. 数据准备（30 分钟干声 + SenseVoice 转写 + 人工抽查）
-# 2. 启动微调（WebUI 或命令行）
-python webui.py finetune \
-    --data_path ./my_dataset \
-    --pretrained_gpt ./pretrained/gpt-weights.ckpt \
-    --pretrained_sovits ./pretrained/sovits-weights.ckpt
+# 1. 下载预训练模型（HuggingFace: lj1995/GPT-SoVITS）放到 GPT_SoVITS/pretrained_models
+# 2. 启动 WebUI
+python webui.py
 
-# 3. 训练完成后，用微调权重推理
-python webui.py inference --gpt ./finetuned/gpt.ckpt --sovits ./finetuned/sovits.ckpt
+# 3. 在 WebUI 中依次完成：
+#    1-A 数据格式化（切片 -> ASR 转写 -> 人工校对 -> 生成 .list 训练清单）
+#    1-B SoVITS 微调（填 .list 路径，点开始训练）
+#    1-C GPT 微调（同上）
+#    1-D 推理页签加载微调后的两个权重试听
 ```
 
-（具体命令以仓库最新文档为准。）
+（WebUI 版本迭代较快，具体页签布局以仓库最新文档为准；训练产物是 SoVITS 的 `*.pth` 与 GPT 的 `*.ckpt` 两份微调权重。）
 
 ### 3.2 盲评：微调前后的相似度
 
@@ -129,27 +149,30 @@ python webui.py inference --gpt ./finetuned/gpt.ckpt --sovits ./finetuned/sovits
 # 组织 3 人盲评打分（1-5）
 ```
 
-### 3.3 可懂度：合成语音喂 ASR 测 WER
+### 3.3 可懂度：合成语音喂 ASR 测 CER/WER
 
-**客观指标**：把合成的语音再用 ASR 识别，看识别率——衡量"咬字是否清晰"：
+**客观指标**：把合成的语音再用 ASR 识别，看识别率——衡量"咬字是否清晰"。**中文文本要用 CER（Character Error Rate，字错误率）而不是 WER**——中文没有空格分词，按"字"算才合理；`jiwer` 两者都有：
 
 ```python
-from jiwer import wer
+from jiwer import cer   # 英文场景用 from jiwer import wer
+
+def normalize(t):        # 教学骨架：去标点、繁简统一、数字归一化
+    return t
 
 def intelligibility(tts_model, asr_model, texts):
-    wers = []
+    errors = []
     for text in texts:
         wav = tts_model.synthesize(text)
         hyp = asr_model.transcribe(wav)
-        wers.append(wer(normalize(text), normalize(hyp)))
-    return sum(wers) / len(wers)
+        errors.append(cer(normalize(text), normalize(hyp)))
+    return sum(errors) / len(errors)
 
-wer_before = intelligibility(zero_shot_model, asr, test_texts)
-wer_after = intelligibility(finetuned_model, asr, test_texts)
-print(f"可懂度 WER: 微调前 {wer_before:.2%} -> 微调后 {wer_after:.2%}")
+cer_before = intelligibility(zero_shot_model, asr, test_texts)
+cer_after = intelligibility(finetuned_model, asr, test_texts)
+print(f"可懂度 CER: 微调前 {cer_before:.2%} -> 微调后 {cer_after:.2%}")
 ```
 
-**预期**：微调后相似度主观分上升，可懂度（WER）持平或略降（咬字更清晰）。**两个指标都要报**——相似度升但可懂度崩 = 失败。
+**预期**：微调后相似度主观分上升，可懂度（CER）持平或略降（咬字更清晰）。**两个指标都要报**——相似度升但可懂度崩 = 失败。
 
 ---
 
@@ -158,25 +181,50 @@ print(f"可懂度 WER: 微调前 {wer_before:.2%} -> 微调后 {wer_after:.2%}")
 ### 4.1 FastAPI 流式服务
 
 ```python
+import io
+import wave
+import numpy as np
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
-import io
 
 app = FastAPI()
+SR = 24000   # 与模型输出采样率一致（CosyVoice2 为 24 kHz）
+
+def wav_header(n_samples: int) -> bytes:
+    """生成 WAV 文件头（决定总样本数，让播放器知道时长）。"""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)             # int16
+        w.setframerate(SR)
+        w.writeframes(b"\x00\x00" * n_samples)   # 只为写出合法头部
+    return buf.getvalue()
 
 @app.post("/tts")
 def tts(text: str, stream: bool = True):
-    def generate():
-        for chunk in tts_model.synthesize_stream(text):
-            buf = encode_wav_chunk(chunk)     # 编码为 wav 字节流
-            yield buf
-    if stream:
-        return StreamingResponse(generate(), media_type="audio/wav")
-    else:
+    if not stream:
         wav = tts_model.synthesize(text)
         return StreamingResponse(io.BytesIO(encode_wav(wav)),
                                  media_type="audio/wav")
+
+    def generate():
+        # WAV 头部只发一次（先于音频数据），后面全部是裸 PCM：
+        header_sent = False
+        for chunk in tts_model.synthesize_stream(text):   # 每块为 float32 波形
+            pcm = (np.clip(chunk, -1, 1) * 32767).astype(np.int16).tobytes()
+            if not header_sent:
+                yield wav_header(estimate_total_samples(text))  # 教学骨架：estimate_total_samples 按语速估算字数×每字时长补齐
+                header_sent = True
+            yield pcm
+    return StreamingResponse(generate(), media_type="audio/wav")
 ```
+
+（非流式分支里的 `encode_wav` 同为教学骨架：用上面 `wave` 模块把完整波形写入 `BytesIO` 即可。）
+
+**这段代码的两个真坑**（比"会不会写"更重要）：
+
+1. **WAV 不是为流式设计的容器**：它的头部写死了"总样本数"。把多个"完整 wav chunk"直接拼接给客户端，得到的是**非法文件**——只有第一个头生效。上面代码的对策是"头只发一次、后面发裸 PCM"，但总样本数是估的（**简化做法**，多数播放器能容忍）；**工程做法**是换成真正为流式设计的容器（Ogg/Opus、WebM/Opus，浏览器 `<audio>` 原生支持）。
+2. **同步端点阻塞**：`def tts` 里的模型推理是阻塞计算，FastAPI 会在线程池里跑同步生成器——demo 够用，并发一高就顶不住；生产上应把推理拆到独立进程/服务（如 vLLM 风格的推理服务），网关只做转发。
 
 **流式的关键**：用 `StreamingResponse` 边生成边下发，客户端首包延迟低——这正是你结课助手（Stage 7）需要的"边想边说"。
 

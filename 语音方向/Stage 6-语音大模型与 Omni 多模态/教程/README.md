@@ -26,7 +26,7 @@ $$
 - Stage 5 的 RVQ / codec 知识——第 4 周会深挖并与量化方向联动；
 - VLM & VLA 阶段的 LLaVA / Qwen2-VL（M-RoPE）/ LoRA 知识——本阶段大量逐项对照；
 - 云 GPU（预算无上限）用于第 2 周部署 7B 与第 5-6 周微调；
-- 依赖：`pip install transformers modelscope ms-swift`，`encodec`、`moshi`（含 Mimi）。
+- 依赖：`pip install "transformers>=4.51" accelerate modelscope ms-swift soundfile`；`encodec`（第 4 周码率扫描）、`moshi`（可选，Mimi 的另一套官方加载方式）。
 
 ## 与其他方向的联动
 
