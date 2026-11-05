@@ -7,7 +7,7 @@
 
 对应学习计划：第 3 周。交付物：搭建 verl 环境，单卡/多卡跑通官方 GRPO 最小 Demo（Qwen 0.5B 级 + GSM8K），WandB 监控 `actor/kl_divergence`、`reward/mean`、`response_length`。
 
-**框架说明**（已核实 GitHub main 分支，2026-09，v0.9.0）：verl 已迁移至 `verl-project/verl`，是 HybridFlow 论文（arXiv:2409.19256）的开源实现；官方对 3D-HybridEngine 的描述为"efficient actor model resharding—eliminates memory redundancy and significantly reduces communication overhead during transitions between training and generation phases"。框架演进快（vLLM/SGLang 版本要求、配置字段随版本变化），**以你安装版本的官方文档为准**，本文聚焦不随版本漂移的架构原理。
+**框架说明**（已核实 GitHub main 分支，2026-09，v0.9.1）：verl 已迁移至 `verl-project/verl`，是 HybridFlow 论文（arXiv:2409.19256）的开源实现；官方对 3D-HybridEngine 的描述为"efficient actor model resharding—eliminates memory redundancy and significantly reduces communication overhead during transitions between training and generation phases"。框架演进快（vLLM/SGLang 版本要求、配置字段随版本变化），**以你安装版本的官方文档为准**，本文聚焦不随版本漂移的架构原理。
 
 ---
 
@@ -30,7 +30,7 @@ RL 每个迭代步的两个阶段：
 
 **矛盾在于两阶段的最优引擎不同**：Rollout 要 vLLM/SGLang（PagedAttention、continuous batching），Training 要 FSDP/Megatron（分布式参数分片、优化器）。而两者操作的是**同一份 Actor 权重**——每个迭代步都要把权重从"训练布局"（分片在多卡）转成"推理布局"（推理引擎可用的形态），用完再转回来。
 
-**朴素方案的代价**：每步全量权重广播/收集 + 推理引擎重新初始化 KV cache 池——权重传输与引擎初始化的耗时可以超过真正的计算时间（尤其大模型 + 高频迭代）。官方博客口径：verl 相比朴素 RLHF 实现可获得最高约 20 倍的吞吐提升（数字来自字节跳动团队发布公告，条件为其测试环境）——提升的主要来源正是消除这个切换开销。
+**朴素方案的代价**：每步全量权重广播/收集 + 推理引擎重新初始化 KV cache 池——权重传输与引擎初始化的耗时可以超过真正的计算时间（尤其大模型 + 高频迭代）。HybridFlow 论文（arXiv:2409.19256）摘要口径：相比 SOTA RLHF 框架，吞吐提升 **1.53×~20.57×**（20 倍为上限、出现在切换开销主导的场景；豆包团队发布公告也以"最高 20 倍吞吐"为标题口径）——提升的主要来源正是消除这个切换开销。
 
 ### 1.2 HybridEngine：resharding 而非重新加载
 
@@ -136,7 +136,7 @@ trainer:
 # 安装 (版本矩阵敏感: vllm/sglang/torch 需配套, 优先用官方 docker 或 uv)
 git clone https://github.com/verl-project/verl.git
 cd verl && pip install -e .
-# 或 docker: 官方镜像自带版本矩阵 (如 vllm==0.12.0, sglang==0.5.6 的稳定镜像)
+# 或 docker: 官方镜像自带版本矩阵 (具体 vllm/sglang 版本以镜像 Dockerfile 为准)
 
 # 官方 GRPO 最小示例 (0.5B 数学模型 + GSM8K, 单卡可跑)
 # 数据准备 (脚本内置 GSM8K 下载与预处理)
@@ -203,7 +203,7 @@ def check(run_metrics: dict):
 - **症状**：Rollout 阶段 OOM（vLLM 分配 KV cache 时）；或 Training 阶段 OOM（优化器状态装不下）。
 - **根因**：`rollout.gpu_memory_utilization` 是给推理引擎的显存预算上限——设太高，训练态的梯度/优化器状态挤不下；设太低，rollout 的 KV cache 不够、长回答采样失败。
 - **定位**：看 OOM 发生的阶段（日志里的 phase 标记）与当时的显存水位。
-- **修复**：压 `max_response_length`、降 G、开 actor 的 CPU offload（FSDP2 offload 与梯度累积兼容，官方 PR #1026）、或减小 mini-batch。这是一个**两阶段预算分配问题**，没有万能值，按 `timing` 曲线迭代。
+- **修复**：压 `max_response_length`、降 G、开 actor 的 CPU offload（FSDP 系 offload 与梯度累积兼容，官方支持）、或减小 mini-batch。这是一个**两阶段预算分配问题**，没有万能值，按 `timing` 曲线迭代。
 
 **失效 2：权重同步静默失败——策略与 rollout 引擎脱节**
 - **症状**：reward 长期不动，但 loss 正常下降；同一条 prompt 的 rollout 输出与手动用训练后 checkpoint 生成的不一致。

@@ -29,4 +29,4 @@ $$
 ## 前置依赖与勘误说明
 
 - 前置：[Stage 2 教程](../Stage%202-VLM%20训练实践与%20SFT%20微调/教程/README.md)（数据格式与 SFT 流程）、[Stage 3 教程](../Stage%203-VLM%20评测体系与幻觉分析/教程/README.md)（归因报告是本阶段的需求来源）。
-- **论文勘误**：学习计划所引 TaskCraft 标题不完整。经核实（arXiv:2506.10055，OPPO Personal AI Lab），正确标题为 ***TaskCraft: Automated Generation of Agentic Tasks***（2025，含工具调用轨迹与执行反馈，约 4 万条任务，数据集结构为 pure_qa / atomic_trace / multihop_subtask_trace 三个 jsonl）。AgentTuning 标题核实无误（*AgentTuning: Enabling Generalized Agent Abilities for LLMs*, arXiv:2310.12823）。第 3 周教程按正确标题引用。
+- **论文勘误**：学习计划所引 TaskCraft 标题不完整。经核实（arXiv:2506.10055，OPPO Personal AI Lab，ICLR 2026），正确标题为 ***TaskCraft: Automated Generation of Agentic Tasks***（约 3.6 万条任务，难度三层：原子任务 → 深度扩展的多跳任务 → 宽度扩展的多工具任务，含工具调用轨迹与执行反馈）。AgentTuning 标题核实无误（*AgentTuning: Enabling Generalized Agent Abilities for LLMs*, arXiv:2310.12823）。第 3 周教程按正确标题引用。

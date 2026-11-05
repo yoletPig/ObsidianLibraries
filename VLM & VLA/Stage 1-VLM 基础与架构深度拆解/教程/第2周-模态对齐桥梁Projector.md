@@ -21,7 +21,7 @@ Bridge 模块要解决的是：**在不破坏两个预训练模型的前提下�
 
 ### 1.2 为什么线性投影不够，两层 MLP 就够
 
-单层线性 $\mathbf{W} \in \mathbb{R}^{d_v \times d_l}$ 只能做**仿射变换**，无法表达非线性对齐。LLaVA-1 论文（*Visual Instruction Tuning*）的消融显示，单层线性投影在语言-图像对齐预训练时效果明显差于 MLP（LLaVA-1.5 报告换成两层 MLP 后在多个 benchmark 上有系统性提升）。
+单层线性 $\mathbf{W} \in \mathbb{R}^{d_v \times d_l}$ 只能做**仿射变换**，无法表达非线性对齐。LLaVA-1.5 论文（*Improved Baselines with Visual Instruction Tuning*）的消融（"Linear → MLP" 是其列出的一项有效改动）显示：把单层线性换成两层 MLP 后，多个 benchmark 有系统性提升。
 
 两层 MLP（Linear → GELU → Linear）引入的非线性足以拟合两个空间之间复杂的流形映射，同时参数量极小：
 
@@ -50,15 +50,15 @@ $$
 | 维度 | Linear / MLP（LLaVA 路线） | Q-Former（BLIP-2 路线） | Perceiver Resampler（Flamingo 路线） |
 | --- | --- | --- | --- |
 | 输出 Token 数 | 与输入相同（$N' = N$，如 576） | 固定（如 32 个 Query → 32 Token） | 固定（如 64 个 Latent → 64 Token） |
-| 参数量 | 极小（约 20M） | 较大（含一个完整 Transformer，约 100M 级） | 中等 |
+| 参数量 | 极小（约 20M） | 较大（含一个完整 Transformer，约 188M，BERT-base 量级） | 中等 |
 | Token 压缩 | 1×（不压缩） | 最高 18×（576→32） | 最高 9×（576→64） |
 | 细节保留 | 完整保留（每个 Patch 都在） | 有损，依赖 Query 学到什么 | 有损，同上 |
 | 训练难度 | 低（收敛快，不易崩） | 高（Query 初始化敏感，需精心设计预训练目标：ITC/ITM/ITG） | 中 |
-| 代表模型 | LLaVA-1.5、Qwen-VL 之后的多数开源 VLM、PaliGemma | BLIP-2、InstructBLIP、Qwen-VL(旧版) | Flamingo、IDEFICS |
+| 代表模型 | LLaVA-1.5、Qwen-VL 之后的多数开源 VLM、PaliGemma | BLIP-2、InstructBLIP | Flamingo、IDEFICS（Qwen-VL 旧版也属此家族：单层 cross-attention 的 Resampler，256 个 Query） |
 
 ### 2.2 Q-Former 的工作机制
 
-Q-Former 是一个小型 Transformer（约 12 层），内含 $M$ 个**可学习的 Query 向量**（如 32 个，$d_q = 768$）。它的前向过程分两步：
+Q-Former 是一个小型 Transformer（约 12 层，从 BERT-base 初始化，总参数约 188M；cross-attention 层每隔一层插入一次），内含 $M$ 个**可学习的 Query 向量**（BLIP-2 用 32 个，$d_q = 768$）。它的前向过程分两步：
 
 1. **Self-Attention**：32 个 Query 互相注意，交换信息、分工（哪个 Query 管物体、哪个管颜色……这个分工是训练中自发形成的，无显式监督）。
 2. **Cross-Attention**：Query 作为 Q，视觉塔的全部 $N$ 个 Patch Token 作为 K 和 V。每个 Query 从 576 个 Patch 中"检索"与自己分工相关的信息。
@@ -66,6 +66,8 @@ Q-Former 是一个小型 Transformer（约 12 层），内含 $M$ 个**可学习
 $$
 \text{CrossAttn}(\mathbf{Q}, \mathbf{V}) = \text{softmax}\left(\frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d_k}}\right)\mathbf{V}, \quad \mathbf{Q} \in \mathbb{R}^{M \times d},\ \mathbf{K}, \mathbf{V} \in \mathbb{R}^{N \times d}
 $$
+
+**这个公式在干什么**：每一行是"第 $m$ 个 Query 对整张图做一次加权汇总"——softmax 权重表示该 Query 应该多关注哪个 Patch（$\mathbf{Q}\mathbf{K}^\top$ 算 Query 与各 Patch 的匹配度，$\sqrt{d_k}$ 防止点积过大把 softmax 推饱和），然后按权重把 $\mathbf{V}$（各 Patch 的内容）加权平均回来。$M$ 行执行完，就得到 $M$ 个"浓缩了全图信息的"向量。
 
 输出永远是 $M$ 个 Token——**与输入图片的分辨率无关**。这是一种"信息瓶颈"设计：无论图片多复杂，都强制压缩为 32 个向量。
 

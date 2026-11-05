@@ -70,7 +70,7 @@ $$
 
 三层解耦的工程价值：**解析层变更（如换标签规范）不影响判定层**；**每类任务的判定器可独立单测**；**汇总层的权重是唯一暴露给实验调节的旋钮**。
 
-### 1.2 各判定器的关键设计
+### 2.2 各判定器的关键设计
 
 - **Grounding/IoU**：坐标解析（多格式兼容：`[x1,y1,x2,y2]` / `(...)`）→ 合法性校验（$x_2 > x_1$，Stage 3 的老纪律）→ IoU 阈值化。进阶版用软奖励：$R = \max(0, (\text{IoU} - 0.3)/0.7)$ 给出连续梯度而非 0/1 悬崖——稀疏 0/1 奖励下早期训练信号极弱，软奖励能显著提高有效组占比（第 1 周失效 1 的预防）。
 - **数学/SymPy**：抽取 `<answer>` 数值 → 归一化（分数/小数互化、$\pi$ 符号处理）→ `sympy.simplify(a - b) == 0` 级的等价判定。注意"等价"与"字面相同"的区别：0.5 与 1/2 应同分。
@@ -215,7 +215,7 @@ def _tests():
     gt_box = [100, 100, 300, 300]
     good = ("<think>左下角为红色物体, 估算其边界约在坐标 100,100 到 300,300。</think>"
             "<answer>[100, 100, 300, 300]</answer>")
-    mid = ("<think>大概在左下。</think><answer>[140, 130, 320, 330]</answer>")   # IoU≈0.66
+    mid = ("<think>大概在左下。</think><answer>[140, 130, 320, 330]</answer>")   # IoU≈0.56
     bad_fmt = "答案是 [100, 100, 300, 300]"                       # 无标签
     no_box = ("<think>我看到了一个物体。</think><answer>在左边</answer>")
     rambler = ("<think>" + "重复内容。" * 2000 + "</think><answer>[100, 100, 300, 300]</answer>")
@@ -237,7 +237,7 @@ def _tests():
     # 数学判定器
     assert eng.math.verify("<answer>3/4</answer>", "0.75") == 1.0
     assert eng.math.verify("<answer>0.3333</answer>", "1/3") == 0.0   # 容差外不给分
-    assert eng.reward("x", gt_box=None) is not None                  # gt 缺失不 crash
+    assert eng.reward("x", None) is not None                         # gt 缺失不 crash
 
     # ---- 批量压力测试: 100 条混合输出 ----
     cases = []
@@ -248,21 +248,19 @@ def _tests():
         elif q == 1:
             cases.append((mid, gt_box, "(0.3,0.9)"))
         elif q == 2:
-            cases.append((bad_fmt, gt_box, "(0,0.5)"))
+            cases.append((bad_fmt, gt_box, "[0,0.2)"))       # 无标签: fmt=0 且 acc=0 -> 0 分
         elif q == 3:
             cases.append((no_box, gt_box, "(0,0.2)"))
         else:
             cases.append(("<think>t</think><answer>[900, 900, 950, 950]</answer>",
-                          gt_box, "(0,0.1)"))                 # 完全错位 -> 近 0
+                          gt_box, "(0,0.1]"))                 # 完全错位 -> 近 0
     for text, gt, expect in cases:
         r, _ = eng.reward(text, gt)
-        lo, hi = (float("nan"), float("nan")) if expect == ">0.9" else (
-            (0.9, 2.0) if expect == ">0.9" else (float(expect.strip("()").split(",")[0]),
-                                                 float(expect.strip("()").split(",")[1])))
         if expect == ">0.9":
             assert r > 0.9
-        else:
-            assert lo < r <= hi, f"奖励越界: {r} vs 预期 {expect}"
+            continue
+        lo, hi = map(float, expect[1:-1].split(","))        # 括号类型仅示意开闭, 统一按闭区间核对
+        assert lo <= r <= hi, f"奖励越界: {r} vs 预期 {expect}"
     print(f"✅ Verifier Engine 测试通过: 满分={r_good} 中质量={r_mid} "
           f"无标签={r_badfmt} 复读惩罚={r_ram} (100 条压力用例全过)")
 
@@ -271,13 +269,13 @@ if __name__ == "__main__":
     _tests()
 ```
 
-**预期输出**：
+**预期输出**（以上代码实测，复读条 len≈10052 字符、惩罚 = (10052−2048)/2048×0.1 ≈ 0.39）：
 
 ```text
-✅ Verifier Engine 测试通过: 满分=1.0 中质量=0.4739 无标签=0.0879 复读惩罚=0.8282 (100 条压力用例全过)
+✅ Verifier Engine 测试通过: 满分=1.0 中质量=0.4309 无标签=0.0 复读惩罚=0.6092 (100 条压力用例全过)
 ```
 
-读数要点：复读惩罚项把"正确但灌水"的回答从 1.0 压到 ~0.83（扣分但不清零，符合 1.2 节"惩罚显式、不没收基础分"的纪律）；中质量回答落在 0.3~0.9 区间（软 IoU 奖励给出连续梯度）。**这个分布形态正是第 1 周"组内有区分度"要求的奖励面**。
+读数要点：无标签回答 `format=0` 且 `<answer>` 为空导致 `acc=0`，得 0 分——这就是"missing_answer 直接 0 分"纪律的代码体现；复读惩罚项把"正确但灌水"的回答从 1.0 压到 ~0.61（扣分但不清零，符合 1.2 节"惩罚显式、不没收基础分"的纪律）；中质量回答落在 0.3~0.9 区间（软 IoU 奖励给出连续梯度，实测 IoU≈0.56 → acc≈0.37 → 总分≈0.43）。**这个分布形态正是第 1 周"组内有区分度"要求的奖励面**。
 
 ### 3.2 接入 verl 的接口约定
 

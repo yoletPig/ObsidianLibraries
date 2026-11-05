@@ -91,19 +91,29 @@ atc --model=model.onnx \
 
 ```bash
 atc ... \
-    --input_shape_range="input:1,80,-1" \   # -1 表示动态维
+    --input_shape="input:-1,80,-1" \
+    --dynamic_dims="1,80,100;2,80,200"
+# -1 表示动态维；--dynamic_dims 枚举实际会用到的一组 shape（分号分隔）
 ```
+
+> **版本注意**：`--input_shape_range` 参数**已被官方废弃**（文档明确标注"该参数已废弃，请勿使用"），动态 shape 统一改用 `--input_shape`（其中维度设 `-1`）配合 `--dynamic_dims` / `--dynamic_batch_size` / `--dynamic_image_size`。老教程里出现的 `input_shape_range` 写法不要再用。
 
 动态 shape 灵活但性能略低于固定形状（无法完全预编译优化）。
 
 ### 3.3 量化联动（对接 Stage 1-2 知识）
 
-ATC 支持转换时做 PTQ。对比两种量化路径：
+**分工要分清**：ATC 是模型转换器，**本身不做 PTQ 校准**。昇腾的训练后量化由专门工具完成：中小模型用 **AMCT**（Ascend Model Compression Toolkit），大模型用 **msModelSlim**（支持 W8A8/W4A8/GPTQ/AWQ 等）。典型链路是：
+
+$$
+\text{量化工具（AMCT/msModelSlim）做量化} \rightarrow \text{量化模型/校准产物} \xrightarrow{\text{ATC}} \text{OM}
+$$
+
+对比两种量化路径：
 
 | 路径 | 做法 | 精度 |
 | --- | --- | --- |
-| ONNX 侧量化 | 先在 ONNX 做量化，ATC 直接转 | 取决于 ONNX 量化 |
-| ATC 侧量化 | 转 OM 时由 ATC 用校准数据量化 | 取决于 ATC 校准 |
+| ONNX 侧量化 | 先在 ONNX 做量化（含 QDQ 节点），ATC 直接转 | 取决于 ONNX 量化 |
+| 昇腾工具链量化 | AMCT/msModelSlim 校准量化，再 ATC 转 OM | 取决于校准数据与工具 |
 
 用你的校准集对比两者精度——这是"量化在哪一层做"的实践认知。
 
@@ -182,6 +192,8 @@ print("ACL 推理八步流程：见注释骨架，完整实现以官方 sample �
 ```bash
 # ATC 支持在转换时插入 dump 点，或开启精度调试
 atc ... --precision_mode=must_keep_origin_dtype   # 保精度模式（降速换精度）
+# 新版 CANN 提示：--precision_mode 已停止演进，官方推荐改用 --precision_mode_v2
+# 需要按算子粒度控制 dtype 时用 --customize_dtypes
 ```
 
 对掉点层：

@@ -7,7 +7,7 @@
 
 对应学习计划：第 1 周。交付物：手写 `Dataset` + `DataCollator`，加载 10 条自定义图文 JSON，输出模型可用的四件套并用断言验证掩码正确。
 
-**源码路径勘误**：学习计划写的 `src/llamafactory/data/collator/` 实际是单文件 [`src/llamafactory/data/collator.py`](https://github.com/hiyouga/LLaMA-Factory/blob/main/src/llamafactory/data/collator.py)（已核实 main 分支，2026 年仍在活跃维护，近期提交涉及 packed M-RoPE 的 position ids 修正）；多模态 Processor 组装逻辑在 [`data/processor/`](https://github.com/hiyouga/LLaMA-Factory/tree/main/src/llamafactory/data/processor) 目录与 [`data/mm_plugin.py`](https://github.com/hiyouga/LLaMA-Factory/blob/main/src/llamafactory/data/mm_plugin.py)。本文按真实路径引用。
+**源码路径勘误**：学习计划写的 `src/llamafactory/data/collator/` 实际是单文件 [`src/llamafactory/data/collator.py`](https://github.com/hiyouga/LLaMA-Factory/blob/main/src/llamafactory/data/collator.py)（已核实 main 分支）；多模态 Processor 组装逻辑在 [`data/processor/`](https://github.com/hiyouga/LLaMA-Factory/tree/main/src/llamafactory/data/processor) 目录与 [`data/mm_plugin.py`](https://github.com/hiyouga/LLaMA-Factory/blob/main/src/llamafactory/data/mm_plugin.py)。本文按真实路径引用。
 
 ---
 
@@ -82,23 +82,23 @@ You are a helpful assistant.<|im_end|>\n
 ┌────────────── Collator ────────────────────────┐
 │ 6. 找 batch 内最长 L_max → 右/左 padding        │
 │ 7. pixel_values 变长 → 沿 batch 维 concat 成    │
-│    [ΣB·N, C, P, P] + image_grid_thw [ΣB, 3]     │
+│    [Σpatches, 1176] + image_grid_thw [B, 3]     │
 │    (Qwen2-VL 风格, 交给模型按网格切分)           │
 │ 8. attention_mask: 真实=1, padding=0            │
 │ 9. labels: 回答区=token_id, 其余=-100           │
 └────────────────────────────────────────────────┘
    ▼
 input_ids [B, L_max] | attention_mask [B, L_max]
-labels [B, L_max]    | pixel_values [ΣN, ...] | image_grid_thw
+labels [B, L_max]    | pixel_values [Σpatches, 1176] | image_grid_thw
 ```
 
 ### 2.2 `image_grid_thw`：变长视觉 Token 的元数据方案
 
 LLaVA 的做法是"占位符在 embedding 层展开"，batch 内 `pixel_values` 形状统一（固定分辨率时）；而 Qwen2-VL 系的动态分辨率下，**每张图的视觉 Token 数都不同**，无法 stack 成规则四维张量。工程解法：
 
-- `pixel_values` 把 batch 内所有图**沿第 0 维 concat**：$[\sum_{b} N_b \cdot \frac{P^2}{4}, C, 14, 14]$（已经过 Patch Merger 前的切分）；
+- `pixel_values` 把 batch 内所有图的 patch **沿第 0 维 concat 成一个二维矩阵**：$[\sum_{b} N_b, 1176]$（每行是一个展平的 patch：$3$ 通道 × 时间 2 × $14 \times 14$ = 1176，仍是 Merger 之前的原始 patch）；
 - 附带 `image_grid_thw: [\sum B, 3]`（每张图的 $t, h, w$ 网格数），模型内部据此把连续的 patch 序列**切回每张图**，做 Merger 与 2D 位置编码；
-- 文本侧 `input_ids` 中每个视觉 Token 占一个坑位（`vision_start` + 扩展位），前向时用 `torch.where` 替换为对应 patch embedding。
+- 文本侧 `input_ids` 中每个视觉 Token 占一个坑位（`<|vision_start|>` + 连续的 `<|image_pad|>` + `<|vision_end|>`），前向时用 `torch.where` 替换为对应 patch embedding。
 
 理解这个设计的钥匙：**变长问题在张量世界里只有两条出路——要么 padding 成规则形状，要么 concat + 元数据记录边界**。视觉用后者（因为视觉 Token 动辄数百个，padding 浪费太大），文本用前者（文本短，padding 便宜）。
 
@@ -159,23 +159,24 @@ from torch.utils.data import Dataset
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
 MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
-IMG_TOKEN_ID = 151655          # Qwen2-VL 的 <image> 占位 ID
+IMG_TOKEN_ID = 151653          # <|image_pad|>: 每个视觉 patch 一个坑位
 IM_END_ID = 151645             # <|im_end|>
 
 
 class MyImageTextDataset(Dataset):
-    """样本级处理: JSON -> 渲染 prompt -> 图片张量 + 分词"""
+    """样本级处理: JSON -> 渲染 prompt -> 图片 + 分词"""
 
-    def __init__(self, path: str, processor: AutoProcessor):
+    def __init__(self, path: str, processor: AutoProcessor, images: list):
         self.samples = json.load(open(path))
         self.processor = processor
+        self.images = images            # PIL.Image 列表, 与样本一一对应
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         s = self.samples[idx]
-        image = s["image"]              # 实际项目中这里做 Image.open + convert("RGB")
+        image = self.images[idx]        # 真实项目中这里做 Image.open + convert("RGB")
         messages = [
             {"role": "user", "content": [
                 {"type": "image"},
@@ -203,7 +204,7 @@ class MyImageTextDataset(Dataset):
         return {
             "input_ids": full_ids,
             "labels": labels,
-            "pixel_values": image,      # 交给 processor 统一处理的占位, 见 collator
+            "image": image,             # 原图交给 collator 统一过 processor
             "prompt_len": len(prompt_ids),
         }
 
@@ -230,30 +231,35 @@ class MyDataCollator:
                                      torch.full((pad,), -100)]))
             attn.append(torch.cat([torch.ones(L,), torch.zeros(pad,)]))
 
-        pixel_values = self.processor(
-            images=[x["pixel_values"] for x in batch], return_tensors="pt")["pixel_values"]
+        proc_out = self.processor(
+            images=[x["image"] for x in batch], return_tensors="pt")
 
         return {
             "input_ids": torch.stack(input_ids),
             "labels": torch.stack(labels),
             "attention_mask": torch.stack(attn),
-            "pixel_values": pixel_values,
+            "pixel_values": proc_out["pixel_values"],        # [Σpatches, 1176]
+            "image_grid_thw": proc_out["image_grid_thw"],    # [B, 3]
         }
 
 
 if __name__ == "__main__":
-    # ---- 构造 10 条测试数据 ----
+    import numpy as np
+    from PIL import Image
+
+    # ---- 构造 10 条测试数据 (JSON 只存对话; 图片在内存中构造为 PIL) ----
     data = [{
         "conversations": [
             {"from": "human", "value": "<image>用一句话描述图片。"},
             {"from": "gpt", "value": f"图片展示了一个测试场景 {i}。"}
-        ],
-        "image": torch.randn(3, 448, 448)      # 模拟已解码图片, 实际为 PIL.Image
+        ]
     } for i in range(10)]
     json.dump(data, open("/tmp/sft_mini.json", "w"))
+    images = [Image.fromarray((np.random.rand(448, 448, 3) * 255).astype("uint8"))
+              for _ in range(10)]
 
     processor = AutoProcessor.from_pretrained(MODEL_ID)
-    ds = MyImageTextDataset("/tmp/sft_mini.json", processor)
+    ds = MyImageTextDataset("/tmp/sft_mini.json", processor, images=images)
     collator = MyDataCollator(processor)
     batch = collator([ds[i] for i in range(4)])
 
@@ -262,7 +268,11 @@ if __name__ == "__main__":
     assert batch["input_ids"].shape == (4, L) and L % 16 == 0
     assert batch["attention_mask"].shape == (4, L)
     assert batch["labels"].shape == (4, L)
-    assert batch["pixel_values"].dim() == 4     # [B, C, H, W]
+    # Qwen2-VL 的 pixel_values 是展平 patch 矩阵: [Σpatches, 3*2*14*14=1176]
+    assert batch["pixel_values"].dim() == 2 and batch["pixel_values"].shape[-1] == 1176
+    assert batch["image_grid_thw"].shape == (4, 3)
+    # 448x448 -> 32x32=1024 个原始 patch, 时间维成对合并后 512 行/图, 共 2048 行
+    assert batch["pixel_values"].shape[0] == 2048
 
     # ---- 核心验证 1: prompt 区间 labels 全为 -100, 回答区间为真实 id ----
     for b in range(4):
@@ -286,16 +296,17 @@ if __name__ == "__main__":
 
     print(f"✅ batch 四件套: input_ids{tuple(batch['input_ids'].shape)}, "
           f"pixel_values{tuple(batch['pixel_values'].shape)}, "
+          f"image_grid_thw{tuple(batch['image_grid_thw'].shape)}, "
           f"监督 Token 占比 {supervised.float().mean():.1%}")
 ```
 
-**预期输出**（形状数字随图片分辨率/文本长度浮动，占比约为 `监督 Token 占比 8%~15%`）：
+**预期输出**（形状数字随图片分辨率/文本长度浮动；448×448 单图 = 256 个合并后的视觉 Token）：
 
 ```text
-✅ batch 四件套: input_ids(4, 1104), pixel_values(4, 3, 448, 448), 监督 Token 占比 9.3%
+✅ batch 四件套: input_ids(4, 304), pixel_values(2048, 1176), image_grid_thw(4, 3), 监督 Token 占比 4.0%
 ```
 
-**一个值得注意的现象**：监督 Token 占比通常只有 5%~15%——prompt、视觉占位、格式头占掉了序列的绝大部分。这正是第 4 周 Sample Packing 有价值的原因：这些被掩码的 Token 虽不算 loss，但仍要参与前向计算，浪费必须靠打包来摊薄。
+**一个值得注意的现象**：监督 Token 占比通常只有 3%~15%——prompt、视觉占位、格式头占掉了序列的绝大部分。这正是第 4 周 Sample Packing 有价值的原因：这些被掩码的 Token 虽不算 loss，但仍要参与前向计算，浪费必须靠打包来摊薄。
 
 ### 3.2 与 LLaMA-Factory 实现对照（源码研读指引）
 

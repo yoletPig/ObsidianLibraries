@@ -30,8 +30,8 @@ $$
 
 | 层级 | 容量（A100 量级） | 延迟 | 谁管理 |
 | --- | --- | --- | --- |
-| 寄存器 | 每线程 ~256 个 32-bit | ~1 cycle | 编译器 |
-| 共享内存（shared） | 每 SM ~100-164 KB | ~20-30 cycles | **程序员显式** |
+| 寄存器 | 每线程最多 255 个 32-bit（A100 每 SM 共 64K 个） | ~1 cycle | 编译器 |
+| 共享内存（shared） | 每 SM 最多 164 KB（A100，可配置） | ~20-30 cycles | **程序员显式** |
 | L2 | 40 MB | ~200 cycles | 硬件 |
 | 显存（HBM） | 40/80 GB | ~500 cycles | 硬件 |
 
@@ -127,7 +127,7 @@ int main() {
 编译与运行：
 
 ```bash
-nvcc -O3 -arch=sm_86 vector_add.cu -o vector_add   # sm_86=30/40系; A100 用 sm_80
+nvcc -O3 -arch=sm_86 vector_add.cu -o vector_add   # sm_86=RTX 30 系/A10; A100 用 sm_80
 ./vector_add
 # 预期输出：vector_add PASS: 16777216 elements, all == 3.0
 ```
@@ -258,7 +258,7 @@ nsys profile ./kernel               # 系统时间线
 
 **常见坑**：`-arch` 与实卡不符 → 编译通过但运行报 `no kernel image`；云上容器缺 `compute-sanitizer` → 用 `apt`/`conda` 补 CUDA Toolkit 完整组件。把这些写进你的实验启动脚本，每次开机 30 秒自检。
 
-### 6.2 本周两个实验的预期数字锚点（对不上就排查）
+### 6.1 本周两个实验的预期数字锚点（对不上就排查）
 
 | 实验 | 预期 | 偏差时查什么 |
 | --- | --- | --- |
@@ -269,7 +269,7 @@ nsys profile ./kernel               # 系统时间线
 
 **爬坡验收标准**：合上文档，仅凭"一个元素一个线程 + 越界保护 + H2D/D2H"三个提示，独立写出 `vector_add` 并编译通过——这是从"读懂"到"会写"的第一道门。
 
-### 6.1 占用率（occupancy）快速心算法
+### 6.2 占用率（occupancy）快速心算法
 
 $$
 \text{occupancy} = \frac{\text{每 SM 活跃 warp 数}}{\text{每 SM 最大 warp 数（如 64）}}

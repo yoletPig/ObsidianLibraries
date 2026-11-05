@@ -7,7 +7,7 @@
 
 对应学习计划：第 2 周。交付物：DeepSpeed `ds_config.json` + 7B+ VLM 的 ZeRO-3 + FA2 训练脚本；8k+ 上下文下对比开/关 FA2 的 TFLOPS 与显存峰值。
 
-**论文**：ZeRO（*ZeRO: Memory Optimizations Toward Training Trillion Parameter Models*, SC 2020）、FlashAttention（*FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*, NeurIPS 2022）——学习计划所引无误。第 1 周的显存账本是本篇的量化基准，Stage 2 第 4 周已铺垫的 BF16/Checkpointing/打包结论不再重复。
+**论文**：ZeRO（*ZeRO: Memory Optimizations Toward Training Trillion Parameter Models*, SC 2020）、FlashAttention（*FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*, NeurIPS 2022）、FlashAttention-2（Dao, arXiv:2307.08691）——学习计划所引无误。第 1 周的显存账本是本篇的量化基准，Stage 2 第 4 周已铺垫的 BF16/Checkpointing/打包结论不再重复。
 
 ---
 
@@ -65,7 +65,7 @@ ZeRO-Offload/Infinity 把切分后的状态进一步搬出 GPU：优化器状态
 2. **Online Softmax**：softmax 的分母依赖全行的 max 与 sum，而 tiling 后每块只看到局部——用递推式维护"全局 max 与 running sum"，每来一块就修正之前的局部结果，**数学上严格等价于全局 softmax**；
 3. 反向不存 $S \times S$ 矩阵，用重算（存小块输入，反向重算中间量）。
 
-收益（第 1 周账本的语言）：显存 $O(S^2) \to O(S)$；HBM 读写量降一个量级 → 计算强度上升 → 长序列下实测 2~4 倍加速（官方口径 A100；**短序列（S≈512）收益有限，不要泛化**）。FA2 调整并行度到序列维、减少非矩阵乘运算，前向再快约 2 倍；FA3（Hopper 架构）进一步利用新硬件特性。
+收益（第 1 周账本的语言）：显存 $O(S^2) \to O(S)$；HBM 读写量降一个量级 → 计算强度上升 → 长序列下注意力核实测最高约 9 倍、端到端常见 1.5~2 倍加速（A100 官方口径；**短序列（S≈512）收益有限，不要泛化**）。FlashAttention-2（arXiv:2307.08691）把并行度调到序列维、减少非矩阵乘运算，相比 FA1 前向再快约 2 倍；FA3（Hopper 架构）进一步利用新硬件特性。
 
 **工程纪律**（第 2 周交付的对比实验公平性）：开启方式 `attn_implementation="flash_attention_2"`；对照组（关闭 FA）用 SDPA 或 eager 且**同精度同 batch**——精度口径不同（fp32 eager vs bf16 FA）的对比是无效对比。
 
@@ -163,7 +163,7 @@ if __name__ == "__main__":
     main()
 ```
 
-**预期形态**（0.5B、S=8192、单卡实测；7B 的相对差距一致）：
+**预期形态**（示意，0.5B、S=8192、单卡；绝对值随硬件与版本浮动，关注相对差距方向）：
 
 ```text
 [sdpa] S=8192  峰值显存=18.4 GB  吞吐≈21 TFLOPS
@@ -210,7 +210,7 @@ if __name__ == "__main__":
 
 ## 4. 延伸思考题
 
-1. **通信量推导**：ZeRO-3 每步的总通信量 = 前向 all-gather（$2P$）+ 反向 all-gather（$2P$）+ reduce-scatter（$2P$）≈ $6P$ 字节，对比 DDP 的 $2P$——3 倍通信。结合第 1 周 2.2 的带宽公式，算 7B 在 NVLink 与 PCIe 上的每步通信时间，解释"ZeRO-3 在快互联上几乎免费、慢互联上不可用"。
+1. **通信量推导**：ZeRO-3 每步的总通信量 = 前向 all-gather（$2P$ 字节）+ 反向 all-gather（$2P$ 字节）+ reduce-scatter（$2P$ 字节）≈ $6P$ 字节；对比 DDP 的梯度 all-reduce = reduce-scatter + all-gather ≈ $4P$ 字节——**1.5 倍通信**（ZeRO 论文口径：ZeRO-1/2 与标准数据并行通信量相同，ZeRO-3 至多 1.5×）。结合第 1 周 2.2 的带宽公式，算 7B 在 NVLink 与 PCIe 上的每步通信时间，解释"ZeRO-3 在快互联上几乎免费、慢互联上代价显著"。
 2. **Online Softmax 的数值稳定性**：证明递推式 $m_{new} = \max(m, m_{block})$，$s_{new} = s \cdot e^{m - m_{new}} + s_{block} \cdot e^{m_{block} - m_{new}}$ 与全局 softmax 严格等价——并解释为什么这个递推同时解决了"数值稳定性"（max 移位）与"流式计算"（无需全行）两个问题。
 3. **量化训练的前瞻**：QLoRA 的 NF4 底座（Stage 2）与 FP8 训练（第 5 周预告）在账本里各动了哪一项？用第 1 周公式算"7B NF4 + LoRA"的模型状态显存，解释为什么它是单卡 7B 微调的默认答案。
 

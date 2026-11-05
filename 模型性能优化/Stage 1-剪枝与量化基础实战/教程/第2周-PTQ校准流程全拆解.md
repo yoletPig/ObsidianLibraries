@@ -108,8 +108,8 @@ INT8/INT4 模型 ──► 引擎特定格式（ORT / TRT / vLLM）
 ### 3.2 三个框架的走读要点
 
 - **llm-compressor**（vLLM 官方）：`oneshot()` 一条命令走 GPTQ/AWQ/SmoothQuant/FP8；底层复用 transformers 的校准 dataloader，产出 vLLM 直接可加载的 compressed-tensors 格式。
-- **ONNX Runtime 静态量化**：`quantize_static(model, output, calibration_data_reader)`——DataReader 提供校准批次，默认增强模式（`QuantType.QInt8` 权重 + `QUInt8` 激活），按算子粒度插入 QDQ 节点。
-- **TensorRT**：`IInt8EntropyCalibrator2`（KL 校准器）——实现 `get_batch()` 喂校准数据，`read_calibration_cache()` 复用缓存；builder 打开 `INT8` flag 后，引擎构建期对每层试 INT8/FP16 两种 tactic 取快者（**精度回退机制**是 TRT 的独特设计）。
+- **ONNX Runtime 静态量化**：`quantize_static(model, output, calibration_data_reader)`——DataReader 提供校准批次，默认 `QuantFormat.QDQ` + 校准方法 MinMax，类型默认 `weight_type=QInt8`、`activation_type=QUInt8`，按算子粒度插入 QDQ（QuantizeLinear/DequantizeLinear）节点。
+- **TensorRT**：`IInt8EntropyCalibrator2`（KL 校准器）——实现 `get_batch()` 喂校准数据，`read_calibration_cache()` 复用缓存；builder 打开 `INT8` flag 后，引擎构建期按 kernel tactic 选择策略逐层挑最快的 INT8/FP16 实现（速度驱动的 tactic 选择，慢的量化内核自动被 FP16 内核替代）。
 
 ---
 
@@ -194,7 +194,7 @@ assert s["Percentile99.9"] > s["KL"] * 0.5, "KL/MSE 类策略应收缩阈值"
 print("校准策略单元自检通过 ✓")
 ```
 
-**预期输出**：MinMax 的 scale 被 ±80 撑大约 16 倍，其余三策略收缩到 ~5 的尾部附近——数值化第 1 周的结论。
+**预期输出**：MinMax 的 scale 被 ±80 撑大约 25 倍（80/127 vs 99.9% 分位 ≈ 3.1 的 3.1/127），其余三策略把裁剪阈值收缩到幅值 3~5 的尾部附近——数值化第 1 周的结论。
 
 ### 4.2 云上跑通：Qwen2.5-1.5B 四策略 PPL 对比
 

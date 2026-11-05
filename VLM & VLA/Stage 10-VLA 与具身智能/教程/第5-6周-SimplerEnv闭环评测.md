@@ -33,12 +33,12 @@
 2. **闭环成功率才是唯一有效指标**，且要报多 episode 统计（单次成功有运气成分——SimplerEnv 标准做法是每任务多 seed + 多 variation 统计）；
 3. **缓解手段的性质**：Action Chunking（少暴露于偏移状态）、数据增广（扩充状态覆盖）、Dagger 式数据聚合（把策略自己跑出的失败状态交专家标注回灌）——都是围绕"让训练分布覆盖策略分布"展开。
 
-### 1.2 SimplerEnv：为 OpenVLA/Octo 定制的"真实复刻"仿真器
+### 1.2 SimplerEnv：为真实机器人策略定制的"真实复刻"仿真评测
 
-SimplerEnv（基于 Sapien 物理引擎，`simpler-env/SimplerEnv`，已核实仓库）的定位：**用视觉高度贴近真实数据集（Google Robot / Bridge V2 的场景与光照复刻）的仿真环境，复现 OXE 真实评测任务**——使 OpenVLA 这类在真实数据上预训练的模型能"无视觉域差"地直接进仿真评估：
+SimplerEnv（基于 SAPIEN 物理引擎与 ManiSkill2_real2sim，仓库 `simpler-env/SimplerEnv`，CoRL 2024 论文 *Simpler: A Simulated Evaluation for Real-Robot Policies*）的定位：**用视觉高度贴近真实数据集（Google Robot / Bridge V2 的场景与光照复刻）的仿真环境，复现 OXE 真实评测任务**——内建 RT-1/RT-1-X/Octo 等策略的实现，OpenVLA 官方也用它做仿真评测——使在真实数据上预训练的模型能"无视觉域差"地直接进仿真评估：
 
-- **任务族**：`google_robot_pick_coke_can`（抓可乐罐）、`move_near`、`open/close_drawer`、Bridge 系列堆叠/放置任务等；
-- **评测维度**：多 seed × 多 variation（光照/纹理/物体位置随机化）——直接量化鲁棒性（学习计划点名的"不同材质、光照、物体摆放"）；
+- **任务族**：`google_robot_pick_coke_can`（抓可乐罐）、`google_robot_move_near`、`open/close_drawer`、Bridge/WidowX 系列（`widowx_spoon_on_towel`、`widowx_carrot_on_plate`、`widowx_stack_cube` 等）；
+- **评测维度**：多 seed × 多 variation（光照/背景/干扰物随机化，Visual Matching 与 Variant Aggregation 两种评测协议）——直接量化鲁棒性（学习计划点名的"不同材质、光照、物体摆放"）；
 - **指标**：任务成功率（Success Rate）+ 每步延迟。
 
 **为什么选 SimplerEnv 而非通用仿真器**：ManiSkill 等平台物理更强但视觉与 OXE 真实数据差异大（VLA 的视觉塔在真实图上预训练，进风格化仿真是 OOD）；SimplerEnv 用"复刻真实视觉"换来了**免域适应直接评测**的便利——评测的结论能更可信地外推到真实数据分布。
@@ -78,10 +78,12 @@ def build_model(mid="openvla/openvla-7b"):
     return model, processor
 
 
-def obs_to_pil(raw_obs):
-    """SimplerEnv 观测 -> PIL 图 (字段名以 env 版本为准)"""
-    img = raw_obs["image"] if "image" in raw_obs else raw_obs["full_image"]
-    return Image.fromarray(np.asarray(img)).convert("RGB")
+def obs_to_pil(env, raw_obs):
+    """SimplerEnv 观测 -> PIL 图。
+    官方推荐入口: simpler_env.utils.env.observation_utils.get_image_from_maniskill2_obs_dict
+    (obs 是 ManiSkill2 风格的嵌套 dict, 图像字段路径随 env 版本有差异)"""
+    from simpler_env.utils.env.observation_utils import get_image_from_maniskill2_obs_dict
+    return get_image_from_maniskill2_obs_dict(env, raw_obs).convert("RGB")
 
 
 def rollout(env, model, processor, instruction: str, max_steps=60, record=None):
@@ -89,20 +91,23 @@ def rollout(env, model, processor, instruction: str, max_steps=60, record=None):
     latencies, frames = [], []
     done = False
     for t in range(max_steps):
-        pil = obs_to_pil(obs)
-        prompt = f"In: What action should the robot take to {instruction.lower()}?"
+        pil = obs_to_pil(env, obs)
+        prompt = f"In: What action should the robot take to {instruction.lower()}?\nOut:"
         # OpenVLA 官方 prompt 模板 (In: ... Out:)
         inputs = processor(prompt, pil).to("cuda", dtype=torch.bfloat16)
         t0 = time.perf_counter()
         with torch.no_grad():
-            action_ids = model.generate(**inputs, do_sample=False,
-                                        max_new_tokens=7)        # 7 个动作 Token
+            # predict_action 内部: 自回归生成 7 个动作 Token -> bin 中心反解 ->
+            # 按 unnorm_key 对应的 norm_stats 反归一化为 7-DoF 物理动作
+            action = model.predict_action(**inputs, do_sample=False,
+                                          unnorm_key="fractal20220817_data")
         latencies.append(time.perf_counter() - t0)
-        action = model.predict_action(**inputs, unnorm_key="bridge_orig", do_sample=False)
-        # ^ unnorm_key: 反归一化统计量 (与第1-2周的 norm_stats 纪律对应)
+        # ^ unnorm_key 必须与预训练数据分布对应: Google Robot 任务用
+        #   "fractal20220817_data", Bridge/WidowX 任务才用 "bridge_orig"
+        #   (见 3.2 失效 1: 键错配是动作幅度异常的头号来源)
         obs, reward, terminated, truncated, info = env.step(np.array(action))
         if record:
-            frames.append(obs_to_pil(obs))
+            frames.append(obs_to_pil(env, obs))
         done = terminated or info.get("success", False)
         if done:
             break
@@ -132,16 +137,17 @@ def main():
     model, processor = build_model()
     env = simpler.make(args.task)                       # 内建 variation 随机化
 
-    results = []
+    results, lats = [], []
     for ep in range(args.episodes):
         ok, lat, steps = rollout(env, model, processor,
                                  "pick up the coke can",
                                  record=f"{args.record}.ep{ep}" if args.record else None)
         results.append(ok)
+        lats.append(lat)
         print(f"ep{ep}: {'✅' if ok else '❌'} steps={steps} latency={lat*1000:.0f}ms")
     sr = np.mean(results)
     print(f"\nSuccess Rate: {sr:.0%} ({sum(results)}/{args.episodes})")
-    print(f"平均单步推理延迟: {np.mean([lat for _, lat, _ in [(0,0,0)]])if False else '见逐条'}")
+    print(f"平均单步推理延迟: {np.mean(lats)*1000:.0f}ms")
     # ---- 统计口径纪律: 多 episode 成功率 + 延迟分位数 ----
     assert args.episodes >= 10, "成功率统计至少 10 个 episode (单次有运气成分)"
     print(f"报告口径: SR={sr:.0%} over {args.episodes} eps @ {args.task}")
@@ -166,7 +172,7 @@ Success Rate: 70% (7/10)
 
 ### 2.2 延迟与控制频率的换算
 
-SimplerEnv 的控制频率与 Google Robot 真实设置对齐（约 3~10Hz 量级）。7B 模型单步 300ms 意味着**有效控制频率 ~3Hz**——低于真实机器人 10Hz+ 的需求。这把第 1-2 周的 Action Chunking 与第 8 周的加速（量化/小模型）从"优化项"变成"必选项"——第 10 周的部署章节正式接手这个问题。
+SimplerEnv 的控制频率对齐真实机器人设置（官方 README 口径：Google Robot 环境 3Hz、Bridge/WidowX 环境 5Hz）。7B 模型单步 300ms 意味着**有效控制频率 ~3Hz**——已经贴着 Google Robot 的 3Hz 底线，更低于真实机械臂 10Hz+ 的需求。这把第 1-2 周的 Action Chunking 与第 8 周的加速（量化/小模型）从"优化项"变成"必选项"——第 10 周的部署章节正式接手这个问题。
 
 ---
 

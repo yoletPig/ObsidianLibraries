@@ -24,16 +24,16 @@ $$
 
 ### 1.2 OBS 的钥匙：单列量化的最优补偿
 
-把目标函数对 $W$ 的某一行做二阶泰勒展开（展开点在原始 $W$，一阶项为 0——预训练模型处于极小点附近）：
+把目标函数对 $W$ 的某一行做泰勒展开。注意这里**不是**因为"预训练模型处于极小点"才没有一阶项——层输出重构误差 $\|X(w-\hat w)^\top\|_F^2$ 本身就是 $(w-\hat w)$ 的**严格二次函数**，一阶项恒等于 0：
 
 $$
 \|XW^\top - X\hat W^\top\|_F^2 \approx (w - \hat w)\, H\, (w - \hat w)^\top, \qquad H = 2X^\top X
 $$
 
-其中 $H$ 是该行重构误差的 Hessian（$n \times n$）。OBS（Optimal Brain Surgeon, Hassibi 1993）告诉我们：**把第 $q$ 个元素强行改成 $\hat w_q$ 后，其余元素的最优调整是**
+其中 $H$ 是该行重构误差的 Hessian（$n \times n$，$n$ 为输入特征维）。OBS（Optimal Brain Surgeon, Hassibi 1993）告诉我们：**把第 $q$ 个元素强行改成 $\hat w_q$ 后，其余元素的最优调整是**
 
 $$
-\Delta w = -\, H_{qq}^{-1}\,(w_q - \hat w_q)\, e_q^{\top} \cdot H_{\cdot q} \quad\Longleftrightarrow\quad w_{-q} \mathrel{+}= -\frac{w_q - \hat w_q}{[H^{-1}]_{qq}}\, [H^{-1}]_{\cdot q,\,-q}
+\Delta w = -\frac{w_q - \hat w_q}{[H^{-1}]_{qq}}\, H^{-1} e_q \quad\Longleftrightarrow\quad w_{-q} \mathrel{+}= -\frac{w_q - \hat w_q}{[H^{-1}]_{qq}}\, [H^{-1}]_{\cdot q,\,-q}
 $$
 
 配套的最小误差增量为
@@ -44,9 +44,9 @@ $$
 
 **直觉**：$[H^{-1}]_{qq}$ 衡量"第 $q$ 列方向上的曲率平坦度"——越平坦，强行改动的代价越小；补偿项沿 $H^{-1}$ 的第 $q$ 列方向摊还误差，恰好抵消输出变化。这就是"为什么 GPTQ 比 RTN 精度好这么多"的标准答案：**RTN 只做了舍入，GPTQ 还做了最优补偿**。
 
-### 1.3 Hessian 累积：$H = 2XX^\top$ 不需要反向传播
+### 1.3 Hessian 累积：$H = 2X^\top X$ 不需要反向传播
 
-$H = 2X^\top X$ 是激活的**外积和**，可以按 batch 在线累积：
+（记号约定：本文 $X$ 按"样本数 × 特征数"排布，故 Hessian 写作 $2X^\top X$；GPTQ 原论文把 $X$ 按特征维在前列排布，写作 $2XX^\top$——是同一个矩阵的转置记法。）$H$ 是激活的**外积和**，可以按 batch 在线累积：
 
 $$
 H \mathrel{+}= 2\, X_b^\top X_b \quad \text{（每个校准 batch 累加一次）}
@@ -104,7 +104,8 @@ def gptq_quantize_layer(W: torch.Tensor, X: torch.Tensor, bits: int = 4,
     H = 2 * X.t() @ X / X.shape[0]
     H += damp * H.diagonal().mean() * torch.eye(n, device=W.device)
 
-    # ② per-group：每组独立做 scale 与 OBS 扫描（此处演示 g = n 的逐组循环）
+    # ② per-group：每组独立定 scale；演示版把 H 也按组切分（官方实现对全行
+    #    的完整 H 做补偿、补偿可跨组传递——教学版只做组内补偿，精度略降）
     W_hat = torch.zeros_like(W)
     for g0 in range(0, n, group):
         g1 = min(g0 + group, n)
@@ -147,27 +148,27 @@ print("GPTQ 单元自检通过 ✓")
 
 ```python
 from llmcompressor import oneshot
-from llmcompressor.modifiers.quantization import GPTQModifier
-from llmcompressor.modifiers.smoothquant import SmoothQuantModifier
+from llmcompressor.modifiers.gptq import GPTQModifier
+from llmcompressor.modifiers.transform.smoothquant import SmoothQuantModifier
 
 recipe = [
     SmoothQuantModifier(smoothing_strength=0.8),      # 可选：先平滑离群激活
     GPTQModifier(targets="Linear", scheme="W4A16",
                  ignore=["lm_head"], block_size=128),
 ]
-oneshot(model="Qwen/Qwen2.5-7B", dataset="ultrachat_200k",
+oneshot(model="Qwen/Qwen2.5-7B", dataset="HuggingFaceH4/ultrachat_200k",
         recipe=recipe, max_seq_length=2048, num_calibration_samples=512,
         output_dir="Qwen2.5-7B-GPTQ-Int4")
 ```
 
 随后用 Stage 1 的评测脚本测 PPL，并与 3.1 的手写版在**同一个单层**上对比：手写 `gptq_quantize_layer` 的输入输出与该层官方量化结果对齐（逐元素差 < 1e-3，差异来自 act-order 与 Cholesky 数值路径——对齐前先关掉 act-order）。
 
-### 3.3 Hessian 累积的可运行演示（$H = 2XX^\top$ 不需要反向传播）
+### 3.3 Hessian 累积的可运行演示（$H = 2X^\top X$ 不需要反向传播）
 
 ```python
 import torch
 
-def hessian_from_calibration(W_shape_n, calib_batches):
+def hessian_from_calibration(n, calib_batches):
     """逐 batch 累积 H = 2 Σ XᵀX / 总样本数——与损失函数无关。"""
     H = torch.zeros(n, n)
     total = 0

@@ -40,11 +40,11 @@ $$
 
 | 量化格式 | 位宽 | vLLM kernel / 后端 | 启动参数 | 典型场景 |
 | --- | --- | --- | --- | --- |
-| GPTQ | W4A16 | **Marlin**（或 exllama） | `--quantization gptq` | 显存受限的 4-bit |
+| GPTQ | W4A16 | **Marlin**（新版默认；旧版曾有 exllama，已被移除） | `--quantization gptq` | 显存受限的 4-bit |
 | AWQ | W4A16 | **Marlin** | `--quantization awq` | 同上，激活感知更稳 |
 | FP8 (W8A8) | 8-bit 浮点 | **cutlass scaled_mm** | `--quantization fp8` | Hopper/Ada，精度好 |
 | INT8-SQ (SmoothQuant) | W8A8 | cutlass int8 gemm | `--quantization compressed-tensors` 等 | INT8 服务部署 |
-| bitsandbytes NF4 | 4-bit | （vLLM 支持有限） | — | 训练侧为主 |
+| bitsandbytes NF4 | 4-bit | `--quantization bitsandbytes`（可加载运行，性能支持有限） | `--load-format bitsandbytes` | 实验为主 |
 
 **关键理解**：
 - **Marlin** 是为 4-bit 权重 × 16-bit 激活优化的 GEMM kernel，batch=1 下能比 FP16 还快（带宽收益 > 反量化开销）；
@@ -172,7 +172,8 @@ $$
 ```python
 # vLLM 动态加载 LoRA 的概念接口
 # 启动时：--enable-lora --lora-modules adapter_a=/path/a adapter_b=/path/b
-# 运行时通过 API 动态增删适配器（以引擎实际接口为准）
+# 运行时动态增删（较新版本）：POST /v1/load_lora_adapter 与 /v1/unload_lora_adapter
+# 注意：这两个端点默认关闭，需环境变量 VLLM_ALLOW_RUNTIME_LORA_UPDATING=true 才生效
 ```
 
 **关键收益**：把"每适配器一个服务实例"降为"一个实例 + 动态适配器"，显存与运维成本大幅下降。
@@ -202,7 +203,7 @@ $$
 **A**：decode 是访存瓶颈，4-bit 权重体积是 FP16 的 1/4，加载时间大幅缩短；这个带宽收益超过了反量化的计算开销，故单请求延迟反而更低。大 batch 下计算占比上升，优势缩小。
 
 **Q2**：FP8 量化为什么需要 Hopper/Ada 架构？
-**A**：FP8 的硬件加速依赖 Tensor Core 对 FP8 数据类型的原生支持，这是 Hopper/Ada 及以后才有的。老架构无原生支持，无法走加速路径。
+**A**：FP8 的硬件加速依赖 Tensor Core 对 FP8 数据类型的原生支持，对应 CUDA compute capability ≥ 8.9（Hopper H100/H200、Ada L40S 等及更新架构）。Ampere（A100）等老架构无原生支持，无法走 FP8 加速路径。
 
 **Q3**：多模态输入进引擎前为什么要"重采样到模型要求"？
 **A**：模型的音频编码器在特定采样率（通常 16 kHz）上训练，特征提取（窗口、维度）都基于该采样率。输入采样率不符会导致时间轴与特征全错，输出失真。

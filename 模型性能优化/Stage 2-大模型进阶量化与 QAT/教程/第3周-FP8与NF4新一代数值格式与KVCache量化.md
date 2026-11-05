@@ -30,7 +30,7 @@ v = (-1)^s \cdot 2^{e-7} \cdot \left(1 + \frac{m}{8}\right) \quad (e \ge 1), \qq
 v = (-1)^s \cdot 2^{-6} \cdot \frac{m}{8} \quad (e = 0,\ \text{次正规})
 $$
 
-例：E4M3 `0 1000 010` → $e=8, m=2$ → $2^{8-7}\cdot(1+2/8) = 2 \times 1.25 = 2.5$。
+例：E4M3 `0 1000 010` → $e=8, m=2$ → $2^{8-7}\cdot(1+2/8) = 2 \times 1.25 = 2.5$。注意深度学习实际用的 E4M3 是 **E4M3FN 变体**：普通 IEEE 规则下 $e=15, m=7$ 应为 480，但该变体把 `S.1111.111` 保留为 NaN、其余 $e=15$ 码点照常编码，于是最大有限值是 $2^8 \times 1.75 = 448$——表中的 448 与 NaN 约定来自这里。
 
 **为什么分工是"前向 E4M3、反向 E5M2"**：权重与前向激活幅度集中在 ±448 内，需要尾数精度；梯度跨多个数量级且偶发极大值，需要 E5M2 的动态范围。这是 *FP8 Formats for Deep Learning*（NVIDIA 白皮书）确立的标准配方。
 
@@ -48,7 +48,7 @@ $$
 
 QLoRA（Dettmers et al., 2023）的 NormalFloat 4 构造：
 
-1. **假设**权重 $w \sim \mathcal{N}(0, \sigma^2)$（实践上先做分块归一化——每块除以该块绝对均值，强制满足）；
+1. **假设**权重 $w \sim \mathcal{N}(0, \sigma^2)$（实践上先做分块归一化——每 64 个权重一块，除以该块的**绝对最大值 absmax** 归一到 $[-1,1]$，强制满足）；
 2. 取标准正态的 $2^4 + 1 = 17$ 个**等概率分位点** $q_i = \Phi^{-1}\!\left(\frac{i}{17}\right)$（把概率质量等分成 16 份）；
 3. 相邻分位点**取中点**作为码点，并显式包含 0；归一化到 $[-1, 1]$。
 
@@ -70,10 +70,10 @@ $$
 
 ### 1.5 KV Cache 量化：长上下文的最后战场
 
-decode 时 KV cache 体积 = $2 \times n_{layers} \times n_{heads} \times d_{head} \times seq \times \text{bytes}$。7B、4K 上下文、FP16 ≈ 4 GB——与权重本身同量级，且**随序列长度线性增长**。两条路线：
+decode 时 KV cache 体积 = $2 \times n_{layers} \times n_{kv\_heads} \times d_{head} \times seq \times \text{bytes}$（GQA 模型用 KV 头数，比注意力头数小得多）。以 Qwen2.5-7B 为例（28 层、GQA 4 个 KV 头、头维 128），4K 上下文 FP16 ≈ 0.24 GB；若是无 GQA 的 MHA 模型（28 个 KV 头）则 ≈ 1.6 GB——且都**随序列长度线性增长**。两条路线：
 
 - **FP8 KV cache**：vLLM/TRT-LLM 已支持，体积减半、精度损失通常 < 0.1 PPL；
-- **KIVI**（Liu et al., 2024）：Key 沿**通道维**、Value 沿 **token 维**做 2-bit 量化（两者离群结构方向不同：Key 离群在通道、Value 离群在早期 token），把 KV 压到 2.6× 以下，支持 4× 长上下文。
+- **KIVI**（Liu et al., 2024，arXiv:2402.02750）：Key 沿**通道维**、Value 沿 **token 维**做 2-bit 量化（两者离群结构方向不同：Key 离群在通道、Value 离群在早期 token），并把少数初始/最近的 token 保留全精度。论文报告：**峰值显存（含权重）降低约 2.6×，可支持最多 4× 的 batch 规模**（吞吐提升 2.35~3.47×）。
 
 ---
 
@@ -81,7 +81,7 @@ decode 时 KV cache 体积 = $2 \times n_{layers} \times n_{heads} \times d_{hea
 
 ```
 NF4/QLoRA 数据流：
-HF 权重 ──► 分块(64) ──► 每块除以 |mean| ──► NF4 码点查表 ──► (q4, scale_fp32)
+HF 权重 ──► 分块(64) ──► 每块除以 absmax ──► NF4 码点查表 ──► (q4, scale_fp32)
                                                      │
                              双重量化：scale_fp32 ──► q8 + 二级 scale
 推理/训练时：q4 ──► 码点查表 ──► × 块 scale ──► FP16 前向
@@ -98,30 +98,40 @@ HF 权重 ──► 分块(64) ──► 每块除以 |mean| ──► NF4 码�
 import torch
 from scipy.stats import norm
 
-def nf4_codebook():
-    """正态分位数中点码本，返回 16 个码点（升序，含 0，归一化到 [-1, 1]）。"""
-    # 等概率分界点：把概率质量 17 等分
-    quantiles = norm.ppf(torch.linspace(0, 1, 18)[1:-1].numpy())  # 15 个内部分界
-    # 码点 = 相邻分界中点；首尾取分布截断代表值
+def nf4_codebook_paper():
+    """QLoRA 论文的概念构造：正态分布 2^4+1=17 个等概率分位点，
+    码点取相邻分位点的中点（升序，含 0，归一化到 [-1, 1]）。"""
+    quantiles = norm.ppf((torch.linspace(0, 1, 18)[1:-1]).numpy())  # 16 个内部分界
     mids = [(quantiles[i] + quantiles[i+1]) / 2 for i in range(len(quantiles)-1)]
-    code = [quantiles[0] - 1.0] + mids + [quantiles[-1] + 1.0]   # 16 个
+    code = [quantiles[0] - 1.0] + mids + [quantiles[-1] + 1.0]      # 16 个码点
     code = torch.tensor(code)
     code[code.abs().argmin()] = 0.0                 # 显式包含 0（QLoRA 做法）
-    return code / code.abs().max()                  # 归一化到 [-1, 1]
+    return code / code.abs().max()
 
-mine = nf4_codebook()
+def nf4_codebook_bnb_symmetric(offset=0.9677083):
+    """bitsandbytes 对称 NF4 码本的同构复现（use_extra_value=False 的构造）：
+    以经验调优的 offset 为最外层分位边界，7 正 + 7 负 + 0。"""
+    pos = norm.ppf(torch.linspace(offset, 0.5, 8)[:-1])   # 7 个正码点（numpy 数组）
+    code = [float(-v) for v in pos[::-1]] + [0.0] + [float(v) for v in pos]
+    code = torch.tensor(code)
+    return code / code.abs().max()
+
+mine = nf4_codebook_bnb_symmetric()
 
 # ---- 与 bitsandbytes 官方数值对齐 ----
 import bitsandbytes.functional as F
-bnb = F.create_normal_map(offset=0.9677083, use_extra_value=False)  # 官方 16 码点
-print("mine:", [f"{v:.4f}" for v in mine.tolist()])
-print("bnb :", [f"{v:.4f}" for v in bnb.tolist()])
-diff = (mine.sort().values - bnb.sort().values).abs().max().item()
-assert diff < 2e-2, f"码本应对齐，实际最大偏差 {diff}"
-print(f"NF4 码本对齐 ✓（最大偏差 {diff:.2e}）")
+bnb = F.create_normal_map(offset=0.9677083, use_extra_value=False)  # 官方 16 码点（对称版）
+bnb16 = bnb[:16]   # 注意：返回的是 256 元素查表（后 242 个是 0 padding），前 16 个才是码点
+print("mine:", [f"{v:.4f}" for v in mine.sort().values.tolist()])
+print("bnb :", [f"{v:.4f}" for v in bnb16.tolist()])
+diff = (mine.sort().values - bnb16).abs().max().item()
+assert diff < 1e-5, f"对称码本应逐位对齐，实际最大偏差 {diff}"
+# 概念版（论文中点法）与官方版量级一致但数值有差异——把最大偏差记下来：
+paper_diff = (nf4_codebook_paper().sort().values - bnb16).abs().max().item()
+print(f"NF4 对称码本对齐 ✓（逐位偏差 {diff:.2e}）；论文中点法与官方版最大偏差 {paper_diff:.3f}")
 ```
 
-**预期输出**：两套码点排序后逐位偏差 < 2e-2（bitsandbytes 用数值积分 + 对称微调，中点法与其在第三位小数上略有出入属正常——把偏差来源写进实验记录）。
+**预期输出**：bitsandbytes 的构造复现逐位对齐（偏差 ~1e-7，浮点误差量级）；论文中点法与官方版最大偏差达零点几——**这不是 bug**：bitsandbytes 的 `create_normal_map` 用的是经验调优的最外层分位边界 `offset=0.9677083`（而非严格的 1/17 等分），且默认的 `nf4` 类型是 `use_extra_value=True` 的**非对称**版（7 负 + 9 正含 0）。论文的"等概率分位点中点"是概念性构造，工程实现做了数值微调——两者的分布形状（0 密、两端疏）一致。把偏差来源写进实验记录。
 
 ### 3.2 QLoRA 云端微调（验证"7B 单卡 24G 可训"）
 
@@ -159,13 +169,17 @@ data = load_dataset("tatsu-lab/alpaca", split="train[:5000]")
 ```python
 def e4m3_decode(bits: int) -> float:
     s = (bits >> 7) & 1; e = (bits >> 3) & 0xF; m = bits & 0x7
+    if e == 15 and m == 7:
+        return float("nan")   # E4M3FN（NVIDIA/PyTorch 约定）：最高码点保留为 NaN
     if e == 0:
         return (-1)**s * 2**(-6) * (m / 8)
     return (-1)**s * 2**(e - 7) * (1 + m / 8)
 
 assert abs(e4m3_decode(0b0_1000_010) - 2.5) < 1e-9
-assert e4m3_decode(0b0_1111_111) == 448          # E4M3 最大值
-print("E4M3 位级解码 ✓：0b0_1000_010 → 2.5，全 1 → 448")
+assert e4m3_decode(0b0_1111_110) == 448          # E4M3 最大有限值：2^8 × 1.75
+import math
+assert math.isnan(e4m3_decode(0b0_1111_111))     # S.1111.111 = NaN，不是 480
+print("E4M3 位级解码 ✓：0b0_1000_010 → 2.5，0b0_1111_110 → 448，全 1 → NaN")
 ```
 
 ---
@@ -214,15 +228,15 @@ def kv_cache_gb(n_layers, n_kv_heads, d_head, seq_len, batch,
     """KV cache 体积：2(K+V) × 层数 × 头数 × 头维 × 序列长 × batch × 字节。"""
     return 2 * n_layers * n_kv_heads * d_head * seq_len * batch * dtype_bytes / 1e9
 
-# Qwen2.5-7B：28 层、28 个 KV 头、头维 128
+# Qwen2.5-7B：28 层、GQA 4 个 KV 头、头维 128（注意不是 28 个——GQA 把 KV 头压缩了 7 倍）
 for seq in (4096, 32768):
     for fmt, b in [("FP16", 2), ("FP8", 1), ("KIVI-INT2", 0.25)]:
-        gb = kv_cache_gb(28, 28, 128, seq, batch=1, dtype_bytes=b)
+        gb = kv_cache_gb(28, 4, 128, seq, batch=1, dtype_bytes=b)
         print(f"seq={seq:>6}, {fmt:>9}: KV = {gb:5.2f} GB")
-# 预期：4K FP16 ≈ 2.1 GB → FP8 减半 → INT2 再减 4×
+# 预期：4K FP16 ≈ 0.23 GB（GQA）；32K FP16 ≈ 1.88 GB——长上下文下 KV 追上权重
 # 断言：FP8 恰好是 FP16 的一半
-fp16 = kv_cache_gb(28, 28, 128, 4096, 1, 2)
-fp8 = kv_cache_gb(28, 28, 128, 4096, 1, 1)
+fp16 = kv_cache_gb(28, 4, 128, 4096, 1, 2)
+fp8 = kv_cache_gb(28, 4, 128, 4096, 1, 1)
 assert abs(fp16 / fp8 - 2.0) < 1e-9
 print("KV 预算计算自检通过 ✓")
 ```
@@ -258,8 +272,8 @@ print("KV 预算计算自检通过 ✓")
 
 | 实验 | 关键数字 | 断言/结论 |
 | --- | --- | --- |
-| NF4 码本对齐 | 最大偏差 _实测_ | < 2e-2 |
-| E4M3 解码练习 | 2.5 与 448 | 断言通过 |
+| NF4 码本对齐 | bnb 复现偏差 _实测_ | ~1e-7 逐位对齐 |
+| E4M3 解码练习 | 2.5、448 与 NaN | 断言通过 |
 | QLoRA 7B 微调 | 峰值显存 _实测_ | < 24 GB |
 | KV 预算计算 | 4K/32K 三档 | FP8 恰为 FP16 一半 |
 
@@ -290,7 +304,7 @@ FP8 几乎无损（< 0.1 PPL）且引擎原生支持；INT2 省得多但长文�
 ## 本周交付清单
 
 - [ ] 手算解码一个 E4M3 数（写出 $2^{e-7}(1+m/8)$ 的代入过程）。
-- [ ] 跑通 NF4 码本生成器，与 `bitsandbytes.create_normal_map()` 对齐（偏差 < 2e-2）。
+- [ ] 跑通 NF4 码本生成器：bitsandbytes 对称构造的复现逐位对齐（偏差 ~1e-7）；记录"论文中点法 vs 官方实现"的偏差并解释来源。
 - [ ] 云上跑通 QLoRA：记录峰值显存（< 24G）、可训练参数比例、500 步 loss 曲线。
 - [ ] 写出双重量化的显存节省推导（0.5 → 0.127 bpw）。
 - [ ] 用自己的话回答：NF4 为什么是"训练格式"而不是"部署格式"？

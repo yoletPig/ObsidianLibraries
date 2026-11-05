@@ -29,4 +29,4 @@ $$
 
 - 建议先完成 [Stage 2 教程](../Stage%202-VLM%20训练实践与%20SFT%20微调/教程/README.md)：本阶段的"评测反哺训练"闭环直接对接 Stage 2 的数据配方方法论。
 - **论文标题勘误**：学习计划所引 HallusionBench 标题有误，正确标题为 *HallusionBench: An Advanced Diagnostic Suite for Entangled Language Hallucination and Visual Illusion in Large Vision-Language Models*（CVPR 2024，已核实 arXiv:2310.14566）。第 3 周教程按正确标题引用。
-- VLMEvalKit 的接口与机制（`generate_inner()`、`use_vllm` 开关、`SPLIT_THINK` 解析等）已对照其 GitHub main 分支核实（2026 年仍在活跃维护），第 2 周教程按已核实事实编写。
+- VLMEvalKit 的接口与机制（`generate_inner()` 接入面、`use_vllm` 加速开关、MCQ 答案提取与 judge 兜底）已对照其 GitHub main 分支核实，第 2 周教程按已核实事实编写；注意该框架迭代较快，具体列名与函数名以所用版本源码为准。

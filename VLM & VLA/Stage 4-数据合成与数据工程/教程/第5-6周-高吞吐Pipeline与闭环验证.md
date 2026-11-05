@@ -37,13 +37,13 @@
 vLLM 启动参考（教师模型服务）：
 
 ```bash
-# 7B 教师模型, 单卡 A100 40G
-python -m vllm.entrypoints.openai.api_server \
-  --model Qwen/Qwen2.5-VL-7B-Instruct \
+# 7B 教师模型, 单卡 A100 40G (vLLM >= 0.7 推荐 `vllm serve`; 旧版等价命令为
+# python -m vllm.entrypoints.openai.api_server)
+vllm serve Qwen/Qwen2.5-VL-7B-Instruct \
   --max-model-len 8192 \
   --max-num-seqs 48 \
   --gpu-memory-utilization 0.90 \
-  --enable-prefix-caching          # 打开前缀缓存 (见 1.3)
+  --enable-prefix-caching          # 打开前缀缓存 (见 1.3); 注意 vLLM >= 0.9 (V1 引擎) 已默认开启
 ```
 
 SGLang 的差异化优势：**RadixAttention 前缀树缓存**（自动发现并复用任意公共前缀的 KV Cache，无需手动声明），且官方基准中在多轮/结构化生成场景吞吐常优于 vLLM（不同版本互有胜负，选型以自己的负载实测为准）。
@@ -154,7 +154,8 @@ async def run(args):
 
     images = [base64.b64encode(open(p, "rb").read()).decode()
               for p in sorted(Path(args.images).glob("*.jpg"))][: 30]
-    jobs = [(img, op) for img in images for op in OPS]     # 30 图 × 5 算子
+    jobs = [(img, op) for img in images for op in OPS]     # 30 图 × 5 算子 = 150 组合
+    # (扩到 3000 条见 2.1 末尾的组合扩展说明; --target 供外层扩量循环读取)
     t0 = time.time()
     await asyncio.gather(*[synth_one(client, sem, args.model, img, op,
                                      out_f, lock, stats) for img, op in jobs])

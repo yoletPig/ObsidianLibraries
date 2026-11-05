@@ -46,13 +46,13 @@ AWQ（Lin et al., 2023）的两个观察：
 1. **权重并非同等重要**：仅约 1% 的权重通道对应着大激活幅度的输入通道，剪掉/量化坏它们会造成显著精度损失（与 Wanda 的 $|W|\cdot|X|$ 观察同源）；
 2. **保护不必保留全精度**：对这 1% 通道做 per-channel 缩放 $s$，让它们的数值幅度变大再量化——等价变换后这些通道的相对量化误差被压小，**不需要混合精度、不需要额外存储原始权重**。
 
-形式化：对选定通道集 $\mathcal{S}$（按 $\bar{|X_j|}$ 取 top-1%），
+形式化：对选定通道集 $\mathcal{S}$（按激活幅度均值 $\bar{|X_j|}$ 取 top-1%），
 
 $$
-Y = XW = (X \cdot s^{-1})(s \cdot W), \qquad s_j = \frac{\bar{|X_j|}^{\,\alpha}}{\max(|W_j|)^{1-\alpha}},\ j \in \mathcal{S}
+Y = XW = Q\big(W \cdot \mathrm{diag}(s)\big)\,\big(\mathrm{diag}(s)^{-1} \cdot X\big), \qquad s_j = \bar{|X_j|}^{\,\alpha},\ j \in \mathcal{S}
 $$
 
-然后对 $s \cdot W$ 做普通的 per-group 量化。注意与 SmoothQuant 的微妙差异：**SmoothQuant 迁的是激活难度（目标是让激活动态范围变小从而可量化）**；**AWQ 放的是显著权重（目标是让重要通道的量化误差变小，激活根本不量化）**。方向相反，哲学不同。
+注意 AWQ 的 $s_j$ **只含激活统计**（激活幅度的 $\alpha$ 次幂），$\alpha \in [0,1]$ 用网格搜索（步长约 0.05）按"该层输出重构误差最小"选出——这与 SmoothQuant 的 $s_j = \max|X_j|^\alpha / \max|W_j|^{1-\alpha}$（显式把权重统计写进公式、为了把难度均匀分给两侧）不同。然后对 $s \cdot W$ 做普通的 per-group 量化，$(\mathrm{diag}(s)^{-1} X)$ 的缩放被吸收进前一层/前一个算子，激活保持 FP16。两派的微妙差异：**SmoothQuant 迁的是激活难度（目标是让激活动态范围变小从而可量化）**；**AWQ 保的是显著权重（目标是让重要通道的量化误差变小，激活根本不量化）**。方向相反，哲学不同。
 
 ### 1.4 AWQ vs GPTQ：一阶保护 vs 二阶补偿
 
@@ -114,14 +114,14 @@ def awq_search_scale(W: torch.Tensor, X: torch.Tensor, bits: int = 4,
     k = max(1, int(W.shape[1] * topk_ratio))
     salient = act_mean.topk(k).indices                      # 1% 显著通道
 
-    w_absmax = W.float().abs().amax(dim=0).clamp(min=1e-8)  # 每输入通道权重极值
     best_alpha, best_err = 0.0, float("inf")
     Y = X.float() @ W.float().t()
 
     for i in range(alpha_grid + 1):
         a = i / alpha_grid
         s = torch.ones(W.shape[1], device=W.device)
-        s[salient] = act_mean[salient].pow(a) / w_absmax[salient].pow(1 - a)
+        # AWQ 论文的参数化：s_j = (激活均值幅度)^α，只含激活统计
+        s[salient] = act_mean[salient].pow(a)
         # 等价变换后量化权重（per-tensor 演示）
         Ws = W.float() * s[None, :]
         sc = Ws.abs().amax() / qmax
@@ -131,7 +131,7 @@ def awq_search_scale(W: torch.Tensor, X: torch.Tensor, bits: int = 4,
         if err < best_err:
             best_err, best_alpha = err, a
     s = torch.ones(W.shape[1])
-    s[salient] = act_mean[salient].pow(best_alpha) / w_absmax[salient].pow(1 - best_alpha)
+    s[salient] = act_mean[salient].pow(best_alpha)
     return s, best_alpha, salient
 
 # ---- 单元自检 ----
@@ -158,20 +158,23 @@ print("已输出 awq_salient_channels.png：两根高柱即 1% 显著通道 ✓"
 ### 3.2 双方案对比（云 GPU）
 
 ```python
-# AWQ：AutoAWQ 官方
+# AWQ：AutoAWQ 官方（tokenizer 需单独加载；AutoAWQ 维护趋缓，新项目可改用 llm-compressor 的 AWQModifier）
 from awq import AutoAWQForCausalLM
+from transformers import AutoTokenizer
 model = AutoAWQForCausalLM.from_pretrained("Qwen/Qwen2.5-7B")
-model.quantize(model.tokenizer, quant_config={"w_bit": 4, "q_group_size": 128})
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B")
+model.quantize(tokenizer, quant_config={"w_bit": 4, "q_group_size": 128,
+                                        "zero_point": True, "version": "GEMM"})
 model.save_quantized("Qwen2.5-7B-AWQ")
 
-# SmoothQuant（W8A8）：llm-compressor
+# SmoothQuant（W8A8）：llm-compressor（官方 W8A8 配方 = SmoothQuant + GPTQModifier）
 from llmcompressor import oneshot
-from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.smoothquant import SmoothQuantModifier
-oneshot(model="Qwen/Qwen2.5-7B", dataset="ultrachat_200k",
+from llmcompressor.modifiers.gptq import GPTQModifier
+from llmcompressor.modifiers.transform.smoothquant import SmoothQuantModifier
+oneshot(model="Qwen/Qwen2.5-7B", dataset="HuggingFaceH4/ultrachat_200k",
         recipe=[SmoothQuantModifier(smoothing_strength=0.8),
-                QuantizationModifier(scheme="W8A8_INT8", targets="Linear",
-                                     ignore=["lm_head"])],
+                GPTQModifier(scheme="W8A8", targets="Linear",
+                             ignore=["lm_head"])],
         num_calibration_samples=512, output_dir="Qwen2.5-7B-SQ-W8A8")
 ```
 

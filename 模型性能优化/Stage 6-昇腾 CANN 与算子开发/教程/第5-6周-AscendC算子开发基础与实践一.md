@@ -75,6 +75,19 @@ struct AddRmsNormTiling {
 
 **Tiling 的取舍**：块太小 → 流水启动/收尾开销占比高；块太大 → UB 装不下。要满足 `块大小 ≤ UB 容量` 且让每个核都有足够活干。
 
+#### 深入拆解：Tiling 公式在干什么（手算小例）
+
+Tiling 的核心约束是一条**显存预算不等式**：一次流水处理的中间数据必须全部装进片上 UB。对本算子，一次要同时在 UB 里放输入 $x$、残差 $r$ 和输出 $y$ 三块 FP16 数据：
+
+$$
+\underbrace{\text{tileRows} \times C \times 2\text{B}}_{x} + \underbrace{\text{tileRows} \times C \times 2\text{B}}_{r} + \underbrace{\text{tileRows} \times C \times 2\text{B}}_{y} \le \text{UB 容量}
+$$
+
+- **为什么需要**：UB（Unified Buffer，片上缓冲）容量有限，装不下就要么溢出报错、要么被迫分成更多小块；
+- **符号含义**：`tileRows` 是每次流水处理的行数，$C$ 是每行列数，FP16 每元素 2 字节；UB 容量随芯片型号而异（910B 一代约 256 KB，老型号 192 KB——以官方规格为准）；
+- **手算小例**：$C = 4096$（一行 FP16 = 8 KB），UB 取 256 KB：$\text{tileRows} \le 256 / (8 \times 3) \approx 10$，即每次流水最多搬 10 行（再留点余量取 8）；
+- **结果拿来做什么**：这个 `tileRows` 就是写 kernel 时每次 `DataCopy` 的分块大小，也是 Tiling 结构体要传给 kernel 的关键参数。
+
 ### 2.3 Double Buffer 流水
 
 用**两块缓冲**轮流：搬第 2 块的同时算第 1 块，算第 1 块的结果往外搬的同时搬第 3 块……搬运与计算重叠。

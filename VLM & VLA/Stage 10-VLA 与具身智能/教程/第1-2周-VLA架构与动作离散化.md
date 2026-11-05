@@ -46,11 +46,15 @@ $$
 \text{bin}(a) = \text{clip}\left(\left\lfloor \frac{a + 1}{2} \cdot B \right\rfloor,\ 0,\ B-1\right)
 $$
 
+**这个公式在干什么**：$(a+1)/2$ 把 $[-1,1]$ 的归一化动作平移拉伸到 $[0,1]$（为什么？后面整条词表只认非负整数编号）；乘 $B=256$ 后取整，就是把这段区间均匀切成 256 格、看动作落进第几格——格子编号就是"动作 Token"。$\text{clip}$ 管的是边界：$a=1.0$ 时算出 256 会越界，强制压回 255。结果拿来做什么：7 个连续小数变成 7 个词表内的整数 Token，机械臂动作从此能像文字一样做 next-token prediction。
+
 **反解（Detokenize）**：取 bin 中心作为重建值：
 
 $$
 \hat{a} = -1 + \frac{2 \cdot (\text{bin} + 0.5)}{B}
 $$
+
+反解是上式的逆过程：$+0.5$ 取的是 bin 的**中心**而不是边缘——一个 bin 覆盖宽度 $2/B$ 的连续区间，用中心值代表整个区间，是"无偏"的选择。
 
 **量化误差**：均匀分箱的最大量化误差为半箱宽：
 
@@ -58,17 +62,19 @@ $$
 |\hat{a} - a|_{\max} = \frac{1}{B} = \frac{2}{2 \times 256} = \frac{1}{256} \approx 0.0039 \ (\text{归一化单位})
 $$
 
-这个误差的实际含义：对位置维，若机械臂工作空间 1m、归一化单位对应 0.5m，则 0.0039 单位 ≈ **2mm**——抓取任务通常可接受，精密装配则不够。**256 bins 是"语言词表成本 vs 控制精度"的折中**：bin 数翻倍 → 动作词表翻倍（Llama 词表 32000 加 7×256=1792 个特殊 Token）→ 输出序列变长但精度提升；不翻倍 → 每步 7 个 Token 的输出长度可控（推理快，控制频率友好）。
+为什么是半箱宽：动作与所属 bin 中心的最远距离就是一个 bin 宽度（$2/B$）的一半。RMS 误差约为半箱宽的 $1/\sqrt{3} \approx 0.58$ 倍（均匀量化噪声性质）。
+
+这个误差的实际含义：对位置维，若机械臂工作空间 1m、归一化单位对应 0.5m，则 0.0039 单位 ≈ **2mm**——抓取任务通常可接受，精密装配则不够。**256 bins 是"语言词表成本 vs 控制精度"的折中**：bin 数翻倍 → 精度翻倍，但动作 Token 的候选集变大、语言词表被挤占；不翻倍 → 每步 7 个 Token 的输出长度可控（推理快，控制频率友好）。**词表成本的准确账（OpenVLA 官方实现口径）**：7 个维度**共享同一段 256 个动作 Token**——Llama 2 词表（32000）的末尾 256 个位置（偏移 31744）被复用为动作 Token，每个维度按顺序各解码一个，并不是"每维一套 256 个 Token"（更不是 7×256=1792 个）。
 
 ### 1.4 Action Chunking：为什么一次预测 k 步
 
-**问题**：逐步预测（每步 1 个动作）有两个病：① **抖动（Jitter）**——模型对相邻帧的预测不一致，机械臂来回晃；② **累积误差**——每步误差在闭环中复利；③ **控制频率压力**——7B 前向一次数百 ms，10Hz 控制要求 100ms 内出动作，逐步预测把推理时间摊在每个控制步上。
+**问题**：逐步预测（每步 1 个动作）有三个病：① **抖动（Jitter）**——模型对相邻帧的预测不一致，机械臂来回晃；② **累积误差**——每步误差在闭环中复利；③ **控制频率压力**——7B 前向一次数百 ms，10Hz 控制要求 100ms 内出动作，逐步预测把推理时间摊在每个控制步上。
 
-**Action Chunking**：一次前向预测未来 $k$ 步的动作序列（$k=4$ 常见，OpenVLA 的多 Token 输出 / ALOFT 式 chunk 化），执行期按序播发（可用插值平滑）：
+**Action Chunking**：一次前向预测未来 $k$ 步的动作序列（$k=4$ 常见于 OpenVLA 系的扩展玩法；ACT/ALOHA 系则激进得多——ACT 一次预测 $k=100$ 步关节位置目标，50Hz 控制下约 2 秒），执行期按序播发（可用插值平滑）：
 
 - **平滑性**：k 步动作来自同一次前向，天然连贯，抖动消失；
 - **频率解耦**：模型以低频推理（如 2Hz 出 4 步 chunk），底层以高频插值执行（10Hz）——**大模型慢推理与机器人快控制的频率鸿沟被 chunk 桥接**（Stage 8 的加速是另一条腿）；
-- **代价**：k 步内无法根据新观测修正（开环 k 步）——k 越大越平滑但适应性越差，replan 频率是核心权衡（ACT/ALOHA 系的 "$C = k$ 步 chunk + 每 $r < k$ 步重规划"是标准折中）。
+- **代价**：k 步内无法根据新观测修正（开环 k 步）——k 越大越平滑但适应性越差，replan 频率是核心权衡。ACT（*Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware*, arXiv:2304.13705）的标准折中是**时间集成（temporal ensembling）**：每个控制步都重新预测一条重叠 chunk，对重叠位置的预测做指数加权平均——既保留 chunk 的平滑，又不放弃逐步纠错。
 
 ---
 
@@ -89,11 +95,13 @@ BINS = 256
 
 
 class ActionTokenizer:
-    """连续 [-1,1]^7 -> 256 bins/维 -> Token IDs (词表内偏移)"""
+    """连续 [-1,1]^7 -> 256 bins/维 -> Token IDs。
+    注意: 7 个维度共享同一段 256 个动作 Token (OpenVLA 官方口径:
+    Llama 2 词表末尾 256 个位置, 偏移 31744), 逐维按序解码"""
 
     def __init__(self, bins: int = BINS, token_offset: int = 31744,
                  vocab_size: int = 32000):
-        assert token_offset + 7 * bins <= vocab_size, "词表空间不足"
+        assert token_offset + bins <= vocab_size, "词表空间不足"
         self.bins, self.offset = bins, token_offset
 
     def tokenize(self, actions: torch.Tensor) -> torch.Tensor:
@@ -104,7 +112,7 @@ class ActionTokenizer:
         # bin(a) = clip(floor((a+1)/2 * B), 0, B-1)
         norm = (actions + 1.0) / 2.0
         b = torch.clamp((norm * self.bins).floor().long(), 0, self.bins - 1)
-        return b + self.offset                            # 词表偏移成 <action_xx>
+        return b + self.offset                            # 词表偏移 (7 维共享同一段动作 Token)
 
     def detokenize(self, tokens: torch.Tensor) -> torch.Tensor:
         """token ids -> bin 中心值 [-1,1]"""
@@ -114,7 +122,8 @@ class ActionTokenizer:
 
 
 def quantization_error(actions: torch.Tensor, recon: torch.Tensor) -> dict:
-    """量化误差统计: 最大误差、RMS 误差 (归一化单位)"""
+    """量化误差统计: 最大误差、RMS 误差 (归一化单位)
+    理论: 最大误差 = 半箱宽 1/256; RMS ≈ 半箱宽/√3 ≈ 0.58×最大误差 (均匀量化噪声)"""
     err = (recon - actions).abs()
     return {"max": err.max().item(), "rms": err.pow(2).mean().sqrt().item(),
             "max_theory": 1.0 / 256}
@@ -135,7 +144,7 @@ if __name__ == "__main__":
     err = quantization_error(actions, recon)
     assert err["max"] <= err["max_theory"] + 1e-9, \
         f"最大量化误差 {err['max']:.5f} 超过理论半箱宽 {err['max_theory']:.5f}"
-    assert err["rms"] < err["max_theory"] / 2, "RMS 误差应显著小于最大误差 (均匀分布性质)"
+    assert err["rms"] < err["max_theory"], "RMS 误差应小于最大误差 (均匀量化噪声性质)"
     # 往返一致性: 对已重建值再 tokenize 必须稳定 (bin 中心是重编不动点)
     assert (tok.tokenize(recon) == tokens).all(), "bin 中心应满足 tokenize∘detokenize 幂等"
 
@@ -166,16 +175,16 @@ if __name__ == "__main__":
 **预期输出**：
 
 ```text
-bins=256: 最大量化误差 0.00389 归一化单位 ≈ 1.56 mm (物理)
+bins=256: 最大量化误差 0.00391 归一化单位 ≈ 1.56 mm (物理)
 ✅ Action Tokenizer 全部断言通过 (往返一致 / 误差符合理论 / 边界饱和正确)
 ✅ Action Chunking: [B=2, k=4, 7] 一次预测 4 步, 每步 7 个动作 Token, 单序列输出 28 Token
 ```
 
-断言验证四个关键性质：**往返一致性**（tokenize∘detokenize 幂等——bin 中心是不动点，这是"训练目标与推理解码自洽"的基础）、**理论误差界**（≤半箱宽 1/256）、**物理换算**（1.56mm < 5mm 的抓取要求）、**边界饱和**（±1 映射到 0/255）。非均匀分箱的改进（高频动作区间加密）在思考题 2 展开。
+断言验证四个关键性质：**往返一致性**（tokenize∘detokenize 幂等——bin 中心是不动点，这是"训练目标与推理解码自洽"的基础）、**理论误差界**（最大 ≤ 半箱宽 1/256；RMS 约 0.0026 ≈ 半箱宽/√3 量级，与均匀量化噪声理论一致）、**物理换算**（1.56mm < 5mm 的抓取要求）、**边界饱和**（±1 映射到 0/255）。非均匀分箱的改进（高频动作区间加密）在思考题 2 展开。
 
 ### 2.2 与 OpenVLA 官方实现对照
 
-OpenVLA 的官方 tokenizer（`openvla/vla/datasets/rlds/dataset_transforms` 附近）与本实现同构：`bins=256`、双端归一化、每维独立分箱；差异在于其归一化统计量按 OXE 数据集维度缓存（`norm_stats`），**跨数据集迁移时归一化参数必须随 checkpoint 走**——这是第 7-9 周微调的高频坑（详见该篇失效模式 2）。
+OpenVLA 的官方 ActionTokenizer（仓库 `prismatic/vla/action_tokenizer.py`）与本实现同构：`bins=256`、在 $[-1,1]$ 上均匀分箱（`np.linspace` 造 bins、`np.digitize` 离散化）、动作 Token 映射到 Llama tokenizer 词表的**末尾 256 个位置**（7 个维度共享这一段）；差异在于其归一化统计量按 OXE 数据集维度缓存（`norm_stats`），**跨数据集迁移时归一化参数必须随 checkpoint 走**——这是第 7-9 周微调的高频坑（详见该篇失效模式 1）。
 
 ---
 

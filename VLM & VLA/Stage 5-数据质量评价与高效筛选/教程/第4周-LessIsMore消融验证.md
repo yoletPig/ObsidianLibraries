@@ -33,7 +33,7 @@ $$
 \text{retention} = \frac{\bar{S}_{\text{filtered}}}{\bar{S}_{\text{full}}} \geq 0.98
 $$
 
-其中 $\bar{S}$ 是各基准的均值（或加权均值）。三个必须写进报告的限定：
+**这个公式在干什么**：分子是"筛选出的 30% 数据训练出的模型"在基准上的平均分，分母是"全量数据训练出的模型"的平均分——两者之比回答"扔掉 70% 数据后保住了多少性能"。0.98 是学习计划的验收线：损失不超过 2%，换来 70% 的训练成本节省，才是"Less is More"成立的量化承诺。其中 $\bar{S}$ 是各基准的均值（或加权均值）。三个必须写进报告的限定：
 
 1. **多基准聚合口径**：单基准 98% 容易过/不过全凭运气，报告应给出逐基准 retention + 聚合 retention；
 2. **噪声边界**：评测噪声（±0.5~1 分量级，Stage 3 经验）下，97.5% 与 98.5% 无实质差别——报告应附"随机 30% 的 retention"作对照，真正的证据是 **C 组 − B 组 的差值及其方向一致性**（在多数基准上 C > B），而非卡死 98% 这条线；
@@ -74,7 +74,7 @@ def main():
     # 打分用纯文本镜像: 多模态版把 <图像占位> 保留, offline LLM 直接喂多模态输入
     # (此处演示文本主干口径; 完整多模态打分用 vllm 的 multi_modal_data 输入, 结构相同)
     llm = LLM(model=args.model, max_model_len=4096,
-              enable_prefix_caching=True)          # chat 模板前缀缓存 (Stage4 红利)
+              enable_prefix_caching=True)          # chat 模板前缀缓存 (Stage4 红利; vLLM >= 0.9 已默认开启)
 
     rows = [json.loads(l) for l in open(args.data)]
     prompts, spans = [], []                          # spans: 回答区 [start, end) token 下标
@@ -85,6 +85,9 @@ def main():
                                           add_generation_prompt=True)
         tok_p = processor.tokenizer(p, add_special_tokens=False)["input_ids"]
         tok_a = processor.tokenizer(r["answer"], add_special_tokens=False)["input_ids"]
+        # 注意: prompt 与 answer 分开编码再拼接, 若边界处发生 BPE 合并, span 会偏移
+        # 1 个 Token; 回答区前的最后一位是 <|im_start|>assistant\n, 通常无合并风险,
+        # 但切换 tokenizer 后建议抽查一次 (decode span 与原文比对)
         prompts.append({"prompt_token_ids": tok_p + tok_a})
         spans.append((len(tok_p), len(tok_p) + len(tok_a)))
 

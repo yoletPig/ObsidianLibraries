@@ -55,6 +55,8 @@ $$
 2. **截断比例不是普适常数**：Bottom 20% / Top 5% 是学习计划的合理起点，但最佳比例依赖参考模型强度与数据噪声率——噪声率高的爬取数据应放宽 Top 截断，参考模型较弱时应收缩 Bottom 截断（因为它低估"简单"）。**截断比例本身是消融对象**（第 4 周）。
 3. **NLL 是相对指标**：换参考模型后分数分布整体平移，筛选结论可能翻转。**报告必须绑定参考模型版本**。
 
+> **一句话总结**：NLL 度量"参考模型对这条回答有多意外"，但意外有两个来源——值得学的新知识与纯粹的噪声；两者的 NLL 都在分布两端之外的重叠区，**单一指标无法区分**，所以只能两端截断保中间，并组合 CLIP Score 等独立维度的裁判。
+
 ### 1.4 CLIP Score：图文相关性的独立裁判
 
 NLL 有一个结构性盲区：它度量"模型输出回答的难度"，但**无法察觉回答与图片无关**。一条（错误标注的）图文错配样本，回答可能流畅自然（NLL 中等），CLIP 语义空间里却是两个不相干的世界：
@@ -63,7 +65,9 @@ $$
 \text{CLIP Score} = \cos\big(E_{img}(x_{img}),\ E_{txt}(\text{caption} \oplus Q)\big)
 $$
 
-其中 $E_{img}$、$E_{txt}$ 是 CLIP/SigLIP 的双塔编码器（Stage 1 第 1 周的老朋友），文本侧通常取"问题 + 回答摘要"或 caption。低分样本 = 图与文各说各话 = 图文错配/标注噪声的高发区。SigLIP 的分数分布与 CLIP 不同（Sigmoid 训练导致整体相似度偏低），**阈值不可跨模型迁移**。
+**这个公式在干什么**：CLIP/SigLIP 的双塔编码器（Stage 1 第 1 周的老朋友）把图和文各自压进同一个语义向量空间——在这个空间里，"匹配的图文"方向一致、夹角小。余弦相似度就是"两向量夹角的接近程度"，取值 $[-1, 1]$，越大越相关。它不需要参考答案，属于**无参考（reference-free）指标**，因此可以直接当数据过滤器用。
+
+严格出处：Hessel et al. 2021 的 CLIPScore（*CLIPScore: A Reference-free Evaluation Metric for Image Captioning*，EMNLP 2021，arXiv:2104.08718）定义为 $w \cdot \max(\cos(c, v), 0)$（$w = 2.5$，只对 caption 评分；代码里再乘 100 得到 0~100 的量级）。**数据过滤实践中（如 DataComp 的 CLIP filtering）通常直接用余弦相似度本身**，本教程也用原始余弦——注意两者数值量纲不同，跨文献比较阈值时先确认口径。文本侧通常取"问题 + 回答摘要"或 caption。低分样本 = 图与文各说各话 = 图文错配/标注噪声的高发区。SigLIP 的分数分布与 CLIP 不同（Sigmoid 训练导致整体相似度偏低），**阈值不可跨模型迁移**。
 
 **CLIP Score 的第二个用途**：它是第 2 周 Image Necessity 的"静态版"先导——静态地度量图文关联强度，而 Image Necessity 动态地度量"图像对预测的因果贡献"。两者互补：CLIP Score 高但 $\Delta L_{Img} \approx 0$ 的样本（图相关但答案不依赖图）正是"伪多模态"的典型画像。
 
@@ -74,6 +78,8 @@ NLL 度量"真实答案让模型多意外"，熵度量"模型自身的输出分�
 $$
 H = -\sum_{v \in V} P_\theta(v \mid x, Q, a_{<t}) \log P_\theta(v \mid x, Q, a_{<t})
 $$
+
+**这个公式在干什么**：把模型在当前位置对整个词表的预测概率分布求"分散程度"——分布尖峰（一个候选概率接近 1）熵趋近 0，分布平摊（几百个候选都有份）熵大。注意它与 NLL 的分工：NLL 用**真实答案**检验模型（答案概率多低），熵只看**模型自己**（它有多犹豫）——所以熵不需要答案标签，可以在无标注文本上算。两者交叉的判读见下。
 
 （实际计算常取 Top-k 或回答首 Token 的分布熵以控制词表求和成本。）两者的组合很有诊断力：**NLL 高 + 熵低** = 模型很自信但错了（典型的先验陷阱样本，值得高亮审查）；**NLL 高 + 熵高** = 模型不确定且答案出乎意料（新知识或噪声，需进一步区分）；**NLL 低 + 熵低** = 已掌握（冗余）。
 
@@ -91,6 +97,7 @@ $$
 """
 import argparse
 import json
+import math
 import torch
 from PIL import Image
 
@@ -111,7 +118,9 @@ def batch_nll_ppl(model, processor, batch, device):
                        padding=True).to(device)
     labels = inputs["input_ids"].clone()
     labels[inputs["attention_mask"] == 0] = -100
-    # 定位回答区起点: 渲染两次取长度差 (prompt-only 长度), 与 Stage2 教程同构
+    # 定位回答区起点: 渲染两次取长度差 (prompt-only 长度), 与 Stage2 教程同构。
+    # 注意: 回答首 Token 若与 prompt 尾字符发生 BPE 合并, 该边界会偏移 1 个 Token——
+    # 上线前用 2.2 节自检第 1 条肉眼验证监督区
     plens = []
     for i, t in enumerate(texts):
         ans_head = r_answer_head(batch[i])
@@ -172,7 +181,7 @@ def main():
         clips = batch_clip_score(clip_model, clip_proc, batch, device)
         for r, nll, cs in zip(batch, nlls, clips):
             scores.append({**{k: r[k] for k in ("question", "answer", "image")},
-                           "nll": round(nll, 4), "ppl": round(pow(2.718281828, nll), 2),
+                           "nll": round(nll, 4), "ppl": round(math.exp(nll), 2),
                            "clip": round(cs, 4)})
         print(f"\r{i + len(batch)}/{len(rows)}", end="")
     with open(args.out, "w") as f:
@@ -191,15 +200,17 @@ def main():
               open("extremes.json", "w"), ensure_ascii=False, indent=1)
 
     # ---- 断言: 指标行为正确 ----
-    assert all(0 <= s["clip"] <= 1 for s in scores), "CLIP 余弦应落在 [-1,1]"
+    assert all(-1 <= s["clip"] <= 1 for s in scores), "CLIP 余弦应落在 [-1,1] (通常为正)"
     assert all(s["nll"] >= 0 for s in scores), "NLL 非负"
     # 教学断言: 随机数据上 NLL 与 CLIP 的相关性应较弱 (度量的是不同维度)
-    import math
     n = [s["nll"] for s in scores]; c = [s["clip"] for s in scores]
     def pearson(x, y):
         mx, my = st.mean(x), st.mean(y)
+        dx = math.sqrt(sum((a-mx)**2 for a in x)); dy = math.sqrt(sum((b-my)**2 for b in y))
+        if dx < 1e-9 or dy < 1e-9:
+            return 0.0                                  # 零方差保护
         cov = sum((a-mx)*(b-my) for a, b in zip(x, y))
-        return cov / math.sqrt(sum((a-mx)**2 for a in x) * sum((b-my)**2 for b in y))
+        return cov / (dx * dy)
     print(f"corr(NLL, CLIP) = {pearson(n, c):.3f}  (弱相关为正常)")
 
     if args.plot:

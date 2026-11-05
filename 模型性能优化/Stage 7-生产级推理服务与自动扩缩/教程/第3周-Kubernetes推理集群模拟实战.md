@@ -156,7 +156,13 @@ spec:
     resource:
       name: cpu
       target: {type: Utilization, averageUtilization: 60}
+  # behavior 字段可精细控制扩缩节奏：
+  # scaleDown.stabilizationWindowSeconds（缩容冷却，默认 300s）、
+  # scaleUp.policies（扩容速率）。推理场景常给扩容更激进的 policy、
+  # 给缩容更长的 stabilization，避免"扩得慢、缩得抖"。
 ```
+
+**注意**：`target: Utilization` 比较的是**资源用量的百分比**（pod 实际用量 / requests 声明量），所以 `resources.requests.cpu` 必须如实声明，否则 60% 的分母就是错的；且 Resource 指标依赖 metrics-server（见 4.3 节安装步骤）。
 
 ### 4.2 为什么推理更适合队列驱动（KEDA）
 

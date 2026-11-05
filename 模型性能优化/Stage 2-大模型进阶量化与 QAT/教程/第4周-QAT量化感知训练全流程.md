@@ -40,7 +40,7 @@ STE 的借口：`FQ(w)` 是 $w$ 的"近似恒等映射"（误差 ≤ $s/2$），
 | --- | --- | --- |
 | **OmniQuant** | 权重截断阈值（LWC）+ 等价变换（LET） | 裁剪点不必是 min/max，让它可学习；等价变换把激活难度搬给权重（SmoothQuant 的可学习版） |
 | **SpinQuant** | 旋转矩阵 $R$ | 对权重/激活做**学习的正交旋转**（Hadamard 初始化），把离群值摊匀再量化——QUIP# 的在线版 |
-| **EfficientQAT** | 无（块级重建） | 把每层当独立小块，用生成的伪输入做免真实数据重建——QAT 的成本降到接近 PTQ |
+| **EfficientQAT** | 无（块级重建） | 两阶段：Block-AP（用少量**真实**校准数据逐块训练**全部参数**）+ E2E-QP（冻结权重，端到端只训练量化参数）——QAT 的成本降到接近 PTQ |
 
 三者的共同趋势：**把 PTQ 时代的"手工超参"（裁剪点、迁移系数、旋转矩阵）变成梯度优化的变量**——这是 QAT 2.0 的方法论。
 
@@ -92,12 +92,14 @@ class FakeQuantize(torch.autograd.Function):
     @staticmethod
     def forward(ctx, w, scale, qmax):
         q = torch.round(w / scale).clamp(-qmax, qmax)
-        ctx.save_for_backward(w, scale, qmax)
+        ctx.save_for_backward(w, scale)   # save_for_backward 只收张量
+        ctx.qmax = qmax                   # 标量直接挂到 ctx 上
         return q * scale
 
     @staticmethod
     def backward(ctx, grad_out):
-        w, scale, qmax = ctx.saved_tensors
+        w, scale = ctx.saved_tensors
+        qmax = ctx.qmax
         # STE：未饱和区域梯度透传，饱和区域置零
         inside = ((w / scale) >= -qmax) & ((w / scale) <= qmax)
         return grad_out * inside, None, None
@@ -117,8 +119,9 @@ qmax = 7
 s = w.detach().abs().amax() / qmax
 resid = (wq.detach() / s).round() * s - wq.detach()
 assert resid.abs().max() < 1e-6, "前向输出必须落在量化网格上"
-# 2) 反向梯度应与直接对 w² 求导一致（STE 透传）
-assert torch.allclose(w.grad, 2 * w, atol=1e-6), "STE 应透传梯度"
+# 2) 反向梯度 = 2·wq（STE 透传：对 FQ(w)² 的梯度按恒等映射回传到 w；
+#    scale=amax/qmax 保证无饱和，inside 全 True，因此 grad 恰为 2·wq）
+assert torch.allclose(w.grad, 2 * wq.detach(), atol=1e-6), "STE 应透传梯度"
 print("Fake Quant + STE 单元自检通过 ✓")
 ```
 
@@ -128,12 +131,12 @@ print("Fake Quant + STE 单元自检通过 ✓")
 # 云环境：A10-24G 可跑 1.5B QAT（bf16 + 梯度）
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from llmcompressor.modifiers.utils.rotation import RotationModifier  # 可选
 
-# QAT 配方：先定网格（PTQ 初始化思想），再进入训练循环
+# QAT 配方：先定网格（PTQ 初始化思想；新版 llm-compressor 还提供
+# SpinQuant/QuIP 等旋转变换 Modifier，可按需加入），再进入训练循环
 recipe = [QuantizationModifier(targets="Linear", scheme="W4A16",
                                ignore=["lm_head"])]
-oneshot(model="Qwen/Qwen2.5-1.5B", dataset="ultrachat_200k",
+oneshot(model="Qwen/Qwen2.5-1.5B", dataset="HuggingFaceH4/ultrachat_200k",
         recipe=recipe, num_calibration_samples=512,
         output_dir="Qwen2.5-1.5B-W4A16-init")     # ← PTQ 初始化产物
 # 随后进入 QAT 训练循环（transformers Trainer + 上述初始化权重），
@@ -186,7 +189,7 @@ print(f"clip 梯度 = {m.clip.grad:.4e} ✓（裁剪点可被梯度下降优化�
 
 ---
 
-## 6. QAT 实验排期表（云资源规划）
+## 4. QAT 实验排期表（云资源规划）
 
 | 实验 | 目的 | 预估资源 | 输出 |
 | --- | --- | --- | --- |
@@ -200,13 +203,13 @@ print(f"clip 梯度 = {m.clip.grad:.4e} ✓（裁剪点可被梯度下降优化�
 - 5-30%：快速回落，斜率最大——权重向网格迁移的主阶段；
 - 30% 后：缓降趋平——此时可评估早停，省下的云时就是钱。
 
-### 6.1 一句话决策模板（面试背诵）
+### 4.1 一句话决策模板（面试背诵）
 
 "先跑一遍 PTQ 拿 Δ：< 0.3 收工；0.3~1.0 试低成本 QAT；≥ 1.0 上全量 QAT 或升位宽。所有判断基于实测，不凭直觉。"
 
 ---
 
-## 7. 面试快问快答（本周内容压缩版）
+## 5. 面试快问快答（本周内容压缩版）
 
 **Q：STE 为什么能让不可导的 round 训练起来？**
 前向输出落在网格上模拟推理数值；反向把 round 当恒等映射透传梯度。借口是 `FQ(w)≈w`（误差有界 $s/2$），局部导数近似 1。
@@ -220,23 +223,23 @@ GPTQ 已把权重放在二阶最优点附近，QAT 只需小幅适配端到端�
 **Q：OmniQuant 的 LET 和 SmoothQuant 什么关系？**
 LET 是可学习的 SmoothQuant：迁移系数不再是固定 α，而是逐层可训练的等价变换参数，由梯度决定难度迁移量。
 
-**Q：EfficientQAT 的"免数据"数据从哪来？**
-用每层输入的统计量（均值/协方差）合成伪输入，做逐层块级重建——省真实语料与全模型前向，代价是合成残差。
+**Q：EfficientQAT 为什么快？**
+两阶段：Block-AP 用少量真实数据逐块训练全部参数，E2E-QP 冻终权重只训量化参数——避免"全参数 × 端到端"的组合成本，把 QAT 拉到接近 PTQ 的量级。
 
 **Q：为什么前 5% step 损失最大？**
 量化噪声刚注入、权重尚未适配网格的"休克期"；STE 梯度驱动权重向网格点迁移后快速回落——这条曲线形态是 QAT 跑对了的标志。
 
 ---
 
-## 4. 工程权衡与失效模式
+## 6. 工程权衡与失效模式
 
-### 4.1 权衡
+### 6.1 权衡
 
 - **成本**：QAT ≈ 一次微调（数据 1-10k、数百~数千步），比 PTQ 贵 10-100×；只在实测 Δ 超标时使用（§1.5 决策树）。
 - **QAT 产物的引擎匹配**：与 GPTQ/AWQ 一样，导出格式必须与目标引擎对齐（llm-compressor 产出的 compressed-tensors 可被 vLLM 直载）。
 - **学到的网格锁死校准分布**：QAT 权重是为训练时的数据分布优化的，部署分布漂移时可能比 PTQ 更敏感——领域数据要混进去。
 
-### 4.2 失效模式
+### 6.2 失效模式
 
 1. **训练初期发散**：症状——注入 Fake Quant 后 loss 爆炸；根因——网格太粗 + 学习率太大；修复——预热、渐进量化（先 8-bit 热身再降到 4-bit）、或 PTQ 初始化。
 2. **STE 饱和梯度死亡**：症状——大量权重卡在裁剪边界不动；根因——`clamp` 区域梯度为零且权重方向一直向外推；修复——放宽初始裁剪范围、LWC 可学习截断（OmniQuant）。
@@ -245,7 +248,7 @@ LET 是可学习的 SmoothQuant：迁移系数不再是固定 α，而是逐层�
 
 ---
 
-## 5. 延伸思考题（含解析）
+## 7. 延伸思考题（含解析）
 
 **Q1**：STE 的梯度近似为什么"够用"？它的失效边界在哪？
 **A**：`FQ(w) ≈ w`（误差有界 $s/2$），所以用恒等映射的导数 1 近似真实次梯度在大部分区域内方向正确，足以驱动梯度下降。失效边界：网格极粗（2-bit）时 $s/2$ 与权重幅度同量级，"近似恒等"不再成立，STE 梯度方向噪声大——这正是低位宽需要 OmniQuant/SpinQuant 等更强结构的原因。
@@ -256,8 +259,8 @@ LET 是可学习的 SmoothQuant：迁移系数不再是固定 α，而是逐层�
 **Q3**：OmniQuant 的 LET 与 SmoothQuant 是什么关系？
 **A**：LET（Learnable Equivalent Transformation）就是"可学习的 SmoothQuant"：迁移系数不再是固定超参 $\alpha$，而是逐层可训练的等价变换参数，由梯度决定难度该迁多少、迁到哪——把经验规则升级为数据驱动。
 
-**Q4**：EfficientQAT 声称"免数据"，它的数据从哪来？
-**A**：用每层输入分布的统计量（均值/协方差）**合成**伪输入，对每层做独立块级重建训练——省掉真实语料与全模型前向，代价是合成输入与真实激活分布的残差。它是"块重建"（GPTQ 的近亲）与"训练"的杂交。
+**Q4**：EfficientQAT 靠什么把 QAT 做到"接近 PTQ 的成本"？
+**A**：两阶段拆解训练目标：Block-AP 用少量真实校准数据（如 512 条 RedPajama）**逐块**训练全部参数（不跑全模型端到端）；E2E-QP 再冻结权重、端到端只训练量化参数（scale/zero-point 等）。省掉的是"全参数 × 全模型端到端"的组合爆炸，而不是数据本身。7B 模型在单卡 A100-80G 上约 11 小时可完成 2-bit 量化训练。
 
 **Q5**：什么时候应该放弃 QAT、改升位宽？
 **A**：当 Δ ≥ 1.0 且任务对精度敏感时，3-bit QAT 的工程成本与不确定性通常高于 4-bit PTQ 的体积成本（差 ~25% 存储）。面试答题模板：**"先算账——体积预算是否真的卡死在 3-bit，不是就别冒低位宽的险"**。

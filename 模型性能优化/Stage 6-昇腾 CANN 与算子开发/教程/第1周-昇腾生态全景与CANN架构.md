@@ -48,8 +48,8 @@
 
 ### 2.3 910B 与 310P 的定位
 
-- **910B**：训练卡，大算力、大显存，用于训练/微调与算子开发验证；
-- **310P**：推理卡，低功耗、性价比，用于部署与端侧/边缘推理。
+- **910B**：训练卡，大算力、大显存，用于训练/微调与算子开发验证。以华为官方 Atlas 800T A2 规格为例，单颗 910B 的 FP16 算力为 **313 或 376 TFLOPS**（随子型号 910B1/B2/B3 而异），64 GB HBM 显存——引用时注明子型号，不要笼统说"910B 算力 XX"；
+- **310P**：推理卡（Atlas 300I 系列），低功耗、性价比，用于部署与端侧/边缘推理。
 
 你的分工：**本地 310P 练部署**（第 2-3 周），**云上 910B 练训练与算子开发**（第 4-8 周）。
 
@@ -75,6 +75,12 @@
 
 ### 3.2 与 CUDA 生态逐项对照（本周交付图的内容）
 
+先记住几个全称（术语首现给英文原名）：
+- **CANN**（Compute Architecture for Neural Networks）：昇腾异构计算架构，即本节的"软件栈"整体；
+- **AscendCL**（Ascend Computing Language）：CANN 的应用开发运行时 API 层，即常说的 ACL；
+- **ATC**（Ascend Tensor Compiler）：模型转换工具；
+- **HCCL**（Huawei Collective Communication Library）：集合通信库。
+
 | 概念/工具 | CUDA 生态 | 昇腾生态 |
 | --- | --- | --- |
 | 编程模型 | CUDA C++ | Ascend C |
@@ -83,7 +89,7 @@
 | 图编译 | TensorRT（推理优化） | **ATC**（模型转 OM）+ GE |
 | 推理部署 | TensorRT / Triton | **ACL 推理 / MindIE** |
 | Profiling | Nsight（nsys/ncu） | **msprof** |
-| 集合通信 | NCCL | **msccl / HCCL** |
+| 集合通信 | NCCL | **HCCL** |
 | 框架适配 | 原生支持 | **torch_npu**（PyTorch） |
 | IDE | — | MindStudio |
 | 设备查询 | `nvidia-smi` | **`npu-smi`** |
@@ -94,7 +100,7 @@
 
 - **ATC**：模型转换器（第 2 周主角），ONNX → OM；
 - **msprof**：性能分析（第 4、7 周用）；
-- **HCCL/msccl**：多卡集合通信（多机训练时用）；
+- **HCCL**：多卡集合通信库（Huawei Collective Communication Library，多机训练时用，对标 NCCL）；
 - **MindStudio**：图形化 IDE（可选）。
 
 ---

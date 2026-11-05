@@ -24,13 +24,13 @@
 
 vLLM 的自动前缀缓存（APC）是"前缀哈希命中"式：请求的 prompt 前缀逐段哈希，命中即复用——但只复用**从头开始的连续公共前缀**，且前缀集合是扁平的。
 
-SGLang 的 **RadixAttention** 把所有请求的 KV Cache 组织成一棵**基数树（Radix Tree）**放在 LRU 缓存里：
+SGLang 的 **RadixAttention**（论文 *Efficiently Programming Large Language Models using SGLang*, arXiv:2312.07104）把所有请求的 KV Cache 组织成一棵**基数树（Radix Tree）**放在 LRU 缓存里：
 
 - **树的每条边** = 一段 Token 序列的 KV 块；
 - **路径** = 一个具体前缀；两条请求在树上共享的路径深度 = 可复用的前缀长度；
 - **任意分支级复用**：请求 A 的前缀 `[S1][S2][S3]` 与请求 B 的 `[S1][S2][S5]` 共享 `[S1][S2]` 段的 KV——**不需要从头对齐**（vLLM APC 其实也支持块级前缀，但 Radix 树把"复用"建模成树操作，跨请求、跨轮次的渐增式共享（第 k 轮在树上是第 k-1 轮路径的延伸）更自然，多轮对话与 agent 多轮工具调用场景是 RadixAttention 的主场）；
 - **LRU 淘汰**：显存紧张时从叶子向根淘汰最久未用的分支；
-- **零手工声明**： unlike 手动 prefix 声明方案，任何公共前缀被**自动发现**——这就是 SGLang 文档口径的"automatic KV cache sharing"。
+- **零手工声明**：不同于手动 prefix 声明方案，任何公共前缀被**自动发现**——这就是 SGLang 文档口径的"automatic KV cache sharing"。
 
 **与 Stage 4 的关系**：Stage 4 用的是"显式把公共前缀排前面"吃 hash 命中；RadixAttention 把这个优化从"prompt 工程纪律"升级为"系统自动行为"——但**prompt 排布纪律依然有效**：公共段在前、变化段在后，树才能长得深。
 
@@ -41,7 +41,7 @@ SGLang 的 **RadixAttention** 把所有请求的 KV Cache 组织成一棵**基�
 - 新请求多 → decode 请求的 ITL 被拉长（排队等 prefill）；
 - 不让新请求插入 → prefill 的算力空转错失。
 
-**Chunked Prefill**：把长 prompt 的 prefill 切成若干 chunk，与 decode 的 token 一起混进每个调度批次——prefill 不再一次性独占 GPU，而是分多次"掺"进 decode 批中。**Piggybacking（搭车）**：把 prefill chunk 搭在正在进行的 decode 批里执行。合并效果（SGLang 论文口径）：**延迟（ITL 平滑度）与吞吐同时改善**——因为 prefill（compute-bound）与 decode（memory-bound）的资源瓶颈互补，混批让 GPU 的算力与带宽同时被利用。这是第 2 周"memory-bound vs compute-bound"概念在调度层的直接应用。
+**Chunked Prefill**：把长 prompt 的 prefill 切成若干 chunk，与 decode 的 token 一起混进每个调度批次——prefill 不再一次性独占 GPU，而是分多次"掺"进 decode 批中。**Piggybacking（搭车）**：把 decode 搭在 prefill chunk 同批执行——该术语出自 Sarathi 论文（*Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills*, arXiv:2308.16369），其续作 Sarathi-Serve（OSDI 2024）给出 stall-free 调度；SGLang 以 `--enable-mixed-chunk` 支持这一混合批，vLLM 也已默认支持 chunked prefill。合并效果（Sarathi-Serve 论文口径）：**延迟（ITL 平滑度）与吞吐同时改善**——因为 prefill（compute-bound）与 decode（memory-bound）的资源瓶颈互补，混批让 GPU 的算力与带宽同时被利用。这是第 2 周"memory-bound vs compute-bound"概念在调度层的直接应用。
 
 ### 1.4 VLM 动态图像 Token 的 batching 冲击
 
@@ -76,8 +76,8 @@ client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 SYS = "You are a careful assistant. " + ("Follow these detailed rules. " * 120)  # ~1k+ Token 常驻前缀
 
 
-def chat_round(history, question):
-    msgs = [{"role": "system", "content": SYS}] + history + [{"role": "user", "content": question}]
+def chat_round(history, question, system=SYS):
+    msgs = [{"role": "system", "content": system}] + history + [{"role": "user", "content": question}]
     t0 = time.perf_counter()
     rsp = client.chat.completions.create(model="m", messages=msgs,
                                          max_tokens=64, temperature=0)
@@ -88,8 +88,10 @@ def chat_round(history, question):
 
 
 def main(rounds=10):
-    # 场景 A: 独立请求 (每轮冷启动, 无共享)
-    cold = [chat_round([], f"问题 {i}: 请给出一个 20 以内的质数。") for i in range(rounds)]
+    # 场景 A: 独立请求 (每轮系统前缀各不相同 -> 无可复用前缀, 才是真"冷启动";
+    # 若都用同一个 SYS, 第 1 轮之后 Radix 树已缓存它, "冷"组也会命中, 基线被污染)
+    cold = [chat_round([], f"问题 {i}: 请给出一个 20 以内的质数。",
+                       system=SYS + f"\n[variant {i}]") for i in range(rounds)]
     # 场景 B: 多轮累积 (Radix 树上路径逐轮延伸, 命中前缀越来越长)
     hot, hist = [], []
     for i in range(rounds):
@@ -109,7 +111,7 @@ if __name__ == "__main__":
     main()
 ```
 
-**预期形态**（本地 7B 实测口径，绝对值随硬件变）：
+**预期形态**（示意读数，本地 7B 口径，绝对值随硬件与引擎版本变，以实测为准）：
 
 ```text
 轮次: 1 2 3 4 5 6 7 8 9 10

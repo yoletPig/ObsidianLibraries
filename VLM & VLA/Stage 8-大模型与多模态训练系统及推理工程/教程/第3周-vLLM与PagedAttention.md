@@ -8,7 +8,7 @@
 
 对应学习计划：第 3 周。交付物：部署 vLLM 推理服务（Qwen2.5-VL/LLaVA），asyncio 压测 50 并发，对比 HF `generate()` 与 vLLM 的 QPS、TTFT、ITL。
 
-**论文**：vLLM（*Efficient Memory Management for Large Language Model Serving with PagedAttention*, SOSP 2023）——学习计划所引无误。Stage 3 第 2 周（评测加速）与本篇的关系：那里是"用"，这里是"懂"。
+**论文**：vLLM（*Efficient Memory Management for Large Language Model Serving with PagedAttention*, SOSP 2023, arXiv:2309.06180）——学习计划所引无误。Stage 3 第 2 周（评测加速）与本篇的关系：那里是"用"，这里是"懂"。
 
 ---
 
@@ -16,15 +16,15 @@
 
 ### 1.1 根本矛盾：KV Cache 的需求是动态的，显存分配是静态的
 
-自回归生成时，已生成 Token 的 K/V 必须缓存（否则每步重算全前缀）。公式（第 1 周 1.3 节）：单序列 KV = $2 \times L \times n_{kv} \times d_{head} \times S \times b$。7B（GQA-8）8k 上下文约 2GB——**一个并发请求就吃掉 GB 级**，服务吞吐的上限直接由"能同时装下多少条 KV"决定。
+自回归生成时，已生成 Token 的 K/V 必须缓存（否则每步重算全前缀）。公式（第 1 周 1.3 节）：单序列 KV = $2 \times L \times n_{kv} \times d_{head} \times S \times b$。7B（32 层、GQA-8、head_dim 128、bf16）8k 上下文 ≈ $2 \times 32 \times 8 \times 128 \times 8192 \times 2$ B ≈ **1.1 GB**——**一个并发请求就吃掉 GB 级**，服务吞吐的上限直接由"能同时装下多少条 KV"决定。
 
-传统实现（HF 风格）为每个请求**按 max_length 预分配一块连续显存**存 KV。论文实测口径（vLLM SOSP 2023，实验条件为其测试的模型与负载）：这种管理方式下**实际有效利用率常仅 20~40%**，浪费来自三处：
+传统实现（HF 风格）为每个请求**按 max_length 预分配一块连续显存**存 KV。论文实测口径（vLLM SOSP 2023，实验条件为其测试的模型与负载）：这种管理方式下**实际有效利用率仅 20.4%~38.2%**，浪费来自三类（论文术语 reserved / internal / external fragmentation）：
 
-1. **内部碎片**：预留 max_length，实际生成 300 Token——预留的 8000 位置大部分闲置；
-2. **预留浪费**：为"可能的最大长度"过度保守预留；
-3. **外部碎片**：连续分配的要求让显存被切成碎片，即使总量够也找不到连续块 → 新请求被拒绝（论文里称之为 memory waste 与 premature preemption 的来源）。
+1. **预留浪费（reserved）**：prefill 阶段就为"未来将生成的 Token"预留 KV 并贯穿整个请求生命周期；
+2. **内部碎片（internal fragmentation）**：按潜在最大长度超额分配——预留 max_length=8000，实际生成 300 Token，闲置 96%；
+3. **外部碎片（external fragmentation）**：连续分配的要求让显存被切成碎片，即使总量够也找不到连续块 → 新请求被拒绝（论文里 memory waste 与 premature preemption 的来源）。
 
-**这解释了 Stage 3/4 阶段"vLLM 快 3~8 倍"的深层原因**：不只 batching 更聪明，而是同样显存能装下数倍的并发序列（KV 利用率从 ~30% 提到 ~90%+）。
+**这解释了 Stage 3/4 阶段"vLLM 快 3~8 倍"的深层原因**：不只 batching 更聪明，而是同样显存能装下数倍的并发序列——论文实测传统管理的 KV 有效利用率仅 **20.4%~38.2%**，PagedAttention 把浪费压到"块内碎片 <4%"的近零水平。
 
 ### 1.2 PagedAttention：把操作系统的虚拟内存搬进 KV Cache
 
@@ -38,7 +38,7 @@ vLLM 的方案逐字借鉴 OS 分页：
 | 按需分页 | KV 按块惰性分配（生成一个块才占一个物理块） |
 | 共享内存页 | **多请求共享相同前缀的物理块**（Copy-on-Write 语义，第 4 周 RadixAttention 的先声） |
 
-收益链条：**碎片消除**（块内浪费 <4%，块粒度 16 Token）→ 同显存可容纳并发数 ×4 以上（论文口径）→ batch 变大 → 吞吐提升。外加两个推论能力：**前缀共享**（同 System Prompt 的请求复用物理块）与**按需抢占/换出**（显存紧张时把低优先级序列的块换出到 CPU）。
+收益链条：**碎片消除**（块内浪费 <4%，块粒度 16 Token，论文默认 block size 16）→ 同显存能容纳的并发请求数提升数倍（论文实测可持续请求率较 Orca 提升约 1.7×~8×、对 FasterTransformer 至多 22×）→ batch 变大 → 吞吐提升（论文口径：吞吐较 SOTA 系统 2~4×）。外加两个推论能力：**前缀共享**（同 System Prompt 的请求复用物理块）与**按需抢占/换出**（显存紧张时把低优先级序列的块换出到 CPU）。
 
 ### 1.3 Continuous Batching：调度粒度从"批"到"迭代"
 
@@ -56,7 +56,7 @@ Continuous Batching（vLLM/SGLang 的默认）：**每次迭代（decode 一步�
 | MQA（Multi-Query） | 1 | **1/32** | 略降 |
 | **GQA**（Grouped-Query） | 分组（如 8） | **1/4** | 接近 MHA |
 
-第 1 周思考题 3 的答案展开：7B 模型 MHA 下 32k 上下文 batch 16 的 KV = 2×32×32×128×32768×16×2B ≈ **171GB**；GQA（8 头）= **43GB**——差 4 倍。GQA 用 1/4 的显存拿到接近 MHA 的质量，是"KV Cache 是推理瓶颈"这一论断在**模型结构侧**的回应（PagedAttention 是系统侧的回应）。现代模型（Qwen2/2.5、Llama-3）几乎清一色 GQA。
+第 1 周思考题 3 的答案展开：7B 模型 MHA 下 32k 上下文 batch 16 的 KV = 2(KV)×32(层)×32(头)×128(head_dim)×32768(S)×16(B)×2(bf16 字节) ≈ **275GB**；GQA（8 头）= **69GB**——差 4 倍。GQA 用 1/4 的显存拿到接近 MHA 的质量，是"KV Cache 是推理瓶颈"这一论断在**模型结构侧**的回应（PagedAttention 是系统侧的回应）。现代模型（Qwen2/2.5、Llama-3）几乎清一色 GQA。
 
 ---
 
@@ -65,9 +65,10 @@ Continuous Batching（vLLM/SGLang 的默认）：**每次迭代（decode 一步�
 ### 2.1 部署与压测
 
 ```bash
-# 部署 VLM 推理服务 (OpenAI 协议)
+# 部署 VLM 推理服务 (OpenAI 协议; served-model-name 与压测脚本里的 model 字段对应)
 python -m vllm.entrypoints.openai.api_server \
   --model Qwen/Qwen2.5-VL-7B-Instruct \
+  --served-model-name served-model \
   --max-model-len 8192 \
   --gpu-memory-utilization 0.90 \
   --max-num-seqs 64

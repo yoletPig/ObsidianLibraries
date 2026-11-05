@@ -33,10 +33,10 @@
 
 ### 2.1 定位
 
-MindIE（MindSpore Inference Engine）是昇腾的 LLM 推理引擎，提供：
+MindIE（**Mind Inference Engine**，昇腾推理引擎套件）是昇腾的大模型推理解决方案，提供：
 - 连续批处理 + PagedAttention（昇腾实现）；
 - OpenAI 兼容 API；
-- MindIE-LLM（大模型推理）与 MindIE-Service（服务层）。
+- 分层组件：**MindIE-LLM**（大模型推理引擎）、**MindIE-Service**（服务化层）、MindIE-Torch/MindIE Runtime（底层加速运行时）。
 
 ### 2.2 配置项对照
 
@@ -76,19 +76,11 @@ MindIE（MindSpore Inference Engine）是昇腾的 LLM 推理引擎，提供：
 ### 3.2 启动服务
 
 ```bash
-# MindIE-Service 启动（示意，实际以官方配置文件为准）
-# 配置：模型路径、TP 数、最大并发、显存占比、端口
-mindie-service-start --config config.json
-```
-
-```json
-{
-  "model_path": "/path/to/model",
-  "tensor_parallel": 1,
-  "max_batch_size": 32,
-  "max_sequence_length": 4096,
-  "port": 8080
-}
+# MindIE-Service 启动：先修改安装目录下的 config.json，再启动守护进程
+# 实际路径随安装方式不同，典型流程（以版本文档为准）：
+vim $MINDIE_SERVICE_HOME/conf/config.json      # 配置模型路径、TP 数、最大并发、端口等
+$MINDIE_SERVICE_HOME/bin/mindieservice_daemon  # 启动服务
+# 日志出现 "Daemon start success!" 即启动成功（首次启动需数分钟）
 ```
 
 ### 3.3 OpenAI 兼容调用
@@ -120,10 +112,12 @@ print(resp.choices[0].message.content)
 ```bash
 python benchmark_serving.py \
     --backend openai-chat \
-    --base-url http://<昇腾主机>:8080/v1 \
+    --base-url http://<昇腾主机>:8080 \
     --model qwen \
     --dataset-name sharegpt \
     --num-prompts 100 --request-rate 4
+# 注意：--base-url 不要带 /v1 后缀——脚本会在其后自动拼接 /v1/chat/completions，
+# 写成 ...:8080/v1 会变成 /v1/v1/... 而全部 404。新版 vLLM 请改用 vllm bench serve。
 ```
 
 记录：吞吐（tokens/s）、TTFT P50/P99、TPOT P50/P99。

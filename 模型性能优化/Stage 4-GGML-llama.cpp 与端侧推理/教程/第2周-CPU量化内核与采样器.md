@@ -3,7 +3,7 @@
 > **本周要回答的问题**
 > 1. AVX2/NEON 在量化 kernel 里到底干了什么？为什么量化对 CPU 是"雪中送炭"而不是"锦上添花"？
 > 2. decode 阶段的 GEMV 怎么吃满内存带宽？prefetch/unroll/SIMD 打包各管什么？
-> 3. 采样器链（temp → top-k → top-p → min-p）的顺序与实现在哪？
+> 3. 采样器链（top-k → top-p → min-p → temperature）的顺序与实现在哪？
 > 4. 从 HF 权重到可服务的 GGUF，完整命令链是什么？
 
 对应学习计划：第 2 周。交付物：① x86 机器上完成「HF → convert_hf_to_gguf → imatrix → Q4_K_M/Q3_K_S 双版本量化」全流程；② 对比两档量化的 tokens/s、内存与生成质量；③ `perf` 火焰图确认 GEMV 占时。
@@ -14,9 +14,9 @@
 
 ### 1.1 为什么量化对 CPU 是雪中送炭
 
-decode 是 GEMV：每 token 搬全部权重一遍。CPU 内存带宽 ~50-100 GB/s（比 HBM 低 20-40 倍），若不量化，7B FP16（14 GB）上限只有 ~5-10 tokens/s。**量化把搬运量压到 1/4，上限直接 ×4**——CPU 没有 Tensor Core 可挖，带宽就是唯一的矿。
+decode 是 GEMV：每 token 搬全部权重一遍。CPU 内存带宽 ~50-100 GB/s（比 HBM 低 20-40 倍），若不量化，7B FP16（14 GB）上限只有 ~4-7 tokens/s。**量化把搬运量压到 1/4，上限直接 ×4**——CPU 没有 Tensor Core 可挖，带宽就是唯一的矿。
 
-同时量化让 SIMD 更划算：一条 `vpmaddubsw`（AVX2）一周期处理 32 个 INT8 乘累加；数据位宽越小，同一条指令吞的有效权重越多。
+同时量化让 SIMD 更划算：一条 `vpmaddubsw`（128-bit）一次算 16 对 8-bit 无符号×有符号乘加（吃进 32 字节输入）；数据位宽越小，同一条指令吞的有效权重越多。
 
 ### 1.2 SIMD 指令集分工
 
@@ -40,16 +40,16 @@ $$
 
 ### 1.4 采样器链：生成质量的手术刀
 
-llama.cpp 的采样按固定顺序作用在 logits 上：
+llama.cpp 的采样按固定顺序组成 sampler chain 作用在 logits 上（当前版本的实现顺序）：
 
 ```
-logits ─► repetition_penalty ─► temperature ─► top-k ─► top-p/nucleus ─► min-p ─► 归一化 ─► 采样
+logits ─► repetition_penalty/DRY ─► top-k ─► top-p/nucleus ─► min-p ─► temperature ─► 归一化采样
 ```
 
 - **temperature**：$p_i \propto \exp(z_i / T)$，$T < 1$ 收紧、$T > 1$ 摊平；
 - **top-k**：只保留概率前 $k$；**top-p**：保留累积概率达到 $p$ 的最小集合；
 - **min-p**：保留 $p_i \ge p_{\max} \times p_{\text{threshold}}$ 的 token——比 top-p 更抗"全分布都很平"的病态场景；
-- 顺序敏感：温度先改变分布形状，截断才有意义；截断在归一化之前。
+- 为什么截断在前、温度在后：top-k/top-p/min-p 都是基于**排序/相对比例**的操作，对单调的温度缩放不敏感（先调温再截断，保留下来的集合相同）；llama.cpp 把 temperature 放在链尾，截断先砍掉长尾再调温采样，`top_k=1` 因此直接退化为贪心解码。
 
 ### 1.5 KV Cache 量化
 
@@ -68,7 +68,9 @@ cmake -B build && cmake --build build -j --config Release
 pip install gguf numpy sentencepiece
 
 # 1) HF 权重 → GGUF（FP16 存储）
-python convert_hf_to_gguf.py Qwen/Qwen2.5-1.5B-Instruct \
+#    注意：convert_hf_to_gguf.py 只吃本地目录——先用 huggingface-cli download
+#    把 Qwen/Qwen2.5-1.5B-Instruct 拉下来，再把本地路径传给脚本
+python convert_hf_to_gguf.py /path/to/Qwen2.5-1.5B-Instruct \
     --outfile qwen2.5-1.5b-f16.gguf --outtype f16
 
 # 2) imatrix：用校准数据统计每通道重要性（低比特必需）
@@ -144,8 +146,8 @@ perf script | stackcollapse-perf.pl | flamegraph.pl > flame.svg
 **Q2**：`vpshufb` 查表解包为什么比移位+掩码快？
 **A**：一条 `vpshufb` 把 32 个 4-bit 索引直接查成 8-bit 值（并行查表），等价于"移位+掩码+符号扩展"好几条指令的合体——指令数减少 = 发射端口压力减少 = 解包不成为点积的瓶颈。
 
-**Q3**：采样器为什么把 temperature 放在 top-k/top-p 之前？
-**A**：截断是对"概率分布形状"的操作——温度先定形状（尖或平），截断才有稳定的语义。若先截断再降温，被裁掉的尾部在低温下本可能抬头，行为不可预测。
+**Q3**：llama.cpp 的 sampler chain 里 temperature 为什么放在 top-k/top-p/min-p 之后？
+**A**：三种截断都基于排序与相对比例，对单调的温度缩放不敏感——先后顺序不影响被保留的候选集合。llama.cpp 选择"先截断、后调温"，好处是截断发生在原始 logits 上语义清晰，且 `top_k=1` 天然退化为贪心解码（温度不再起作用）。自己实现采样链时把这个不变性记住，可以省掉一次排序。
 
 **Q4**：min-p 相比 top-p 解决了什么问题？
 **A**：top-p 的阈值是累积概率——当模型很不确定时（分布平坦），它可能放进几十个低质量 token。min-p 用"相对最大概率"做门槛，分布再平也只放行接近头部的那些，抗"全平"病态更稳。
@@ -199,9 +201,11 @@ print(f"整数域点积 = {y_kernel:.4f}，浮点参考 = {y_float:.4f} ✓")
 import numpy as np
 
 def sample_chain(logits, T=0.7, top_k=40, top_p=0.8, min_p=0.05):
-    """按 llama.cpp 顺序复现采样链，返回候选 token 集合大小。"""
+    """复现采样链语义，返回候选 token 集合大小。
+    注：llama.cpp 实现是"先截断、后调温"；这里先调温后截断——
+    因为三种截断对单调缩放不敏感，保留下来的候选集合完全相同。"""
     z = np.asarray(logits, dtype=np.float64)
-    p = np.exp(z / T); p /= p.sum()          # ① temperature
+    p = np.exp(z / T); p /= p.sum()          # ① temperature（与截断顺序可交换）
     idx = np.argsort(p)[::-1]
     keep = idx[:top_k]                        # ② top-k
     cum = np.cumsum(p[keep])
@@ -213,8 +217,9 @@ np.random.seed(0)
 logits = np.random.randn(32000) * 2          # 模拟词表
 logits[7] = 12.0; logits[42] = 11.0          # 两个头部
 for T in (0.3, 0.7, 1.5):
-    cand = sample_chain(np.full(32000, 0.0) + np.random.randn(32000)*0.1
-                        + np.eye(32000)[7]*T*8, T=T)
+    z = np.full(32000, 0.0) + np.random.randn(32000) * 0.1
+    z[7] += T * 8                            # 用索引赋值注入头部（别用 np.eye 造 32000² 矩阵！）
+    cand = sample_chain(z, T=T)
     print(f"T={T}: 采样后候选数 = {len(cand)}")
 # 预期：温度越低候选越少（分布越尖，截断后剩得越少）
 # 思考：为什么低温 + top-p 小会导致复读？（尾部被裁光，概率集中循环）

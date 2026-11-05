@@ -98,13 +98,13 @@ def parse_answer(item: dict, raw: str):
     """按维度复用第1周提取器逻辑 (此处精简内联)"""
     if item["dim"] == "grounding":
         m = re.findall(r"[\[（(]\s*(\d+)\s*[,，]\s*(\d+)\s*[,，]\s*(\d+)\s*[,，]\s*(\d+)\s*[\]）)]", raw)
-        return [list(map(float, m[-1]))] if m else None
+        # 返回 [x1, y1, x2, y2] 的浮点列表 (与 iou() 的入参约定一致)
+        return list(map(float, m[-1])) if m else None
     norm = raw.strip().lower()
     m = re.search(r"(左边|右侧|右边|左侧|left|right)", norm)
     if item["dim"] == "attribute":
-        return {"左边": "left", "左侧": "left", "left": "left",
-                "右边": "right", "右侧": "right", "right": "right"}.get(
-                m.group(1) if m else "", norm[:20] or None)
+        # 直接返回命中的原词 (如 "左边"/"right"), 与 gt_text 同一表述空间比较
+        return m.group(1) if m else (norm[:20] or None)
     m = re.search(r"\d+", norm)
     return m.group(0) if m else None
 

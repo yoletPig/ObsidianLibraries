@@ -91,8 +91,9 @@ def mm_kernel(a_ptr, b_ptr, c_ptr, M, N, K,
     b_ptrs = b_ptr + offs_k[:, None] * N + offs_n[None, :]
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in range(0, K, BK):                     # K 维分块循环
-        a = tl.load(a_ptrs, mask=(offs_k[None, :] < K) & (offs_m[:, None] < M), other=0)
-        b = tl.load(b_ptrs, mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0)
+        # 掩码要用"全局 k 偏移"判断越界：offs_k + k < K（否则 K 非整块时尾部读脏数据）
+        a = tl.load(a_ptrs, mask=((offs_k[None, :] + k) < K) & (offs_m[:, None] < M), other=0)
+        b = tl.load(b_ptrs, mask=((offs_k[:, None] + k) < K) & (offs_n[None, :] < N), other=0)
         acc += tl.dot(a, b)                       # 编译器自动映射到 Tensor Core
         a_ptrs += BK; b_ptrs += BK * N
     c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]

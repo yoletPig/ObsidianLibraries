@@ -24,7 +24,7 @@ OpenAI 兼容 API + continuous batching：多请求共享一次前向（decode �
 
 ### 1.3 RKNN 部署的根本逻辑
 
-NPU 的算子集有限、只吃量化模型，所以部署链 = **框架模型 → 中间格式（ONNX）→ 厂商工具链转换+量化 → 板端运行时**：
+RK3588 的 NPU 是三核架构（每核可独立调度，`core_mask` 控制），INT8 算力合计 6 TOPS。NPU 的算子集有限、只吃量化模型，所以部署链 = **框架模型 → 中间格式（ONNX）→ 厂商工具链转换+量化 → 板端运行时**：
 
 $$
 \text{PyTorch} \xrightarrow{\text{export}} \text{ONNX} \xrightarrow[\text{量化(可选)}]{\text{RKNN-Toolkit2}} \text{.rknn} \xrightarrow{\text{RKNN Runtime}} \text{NPU}

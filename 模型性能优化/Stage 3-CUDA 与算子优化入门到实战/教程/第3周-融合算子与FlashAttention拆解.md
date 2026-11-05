@@ -53,7 +53,7 @@ $$
 O^{(t+1)} = \frac{1}{l^{(t+1)}}\Big( e^{m^{(t)} - m^{(t+1)}}\, l^{(t)}\, O^{(t)} + e^{S_{t+1} - m^{(t+1)}} V_{t+1} \Big)
 $$
 
-直觉：当新块里出现更大的 logit 时，旧的指数和与输出都要乘以修正因子 $e^{m^{(t)} - m^{(t+1)}} < 1$ "缩小"——这正是数值稳定 softmax 减去行最大值的在线版本。**全程不需要知道整行的最大值**，因此无需物化 $N \times N$ 矩阵：显存 $O(N)$，且结果与标准实现逐比特等价（非近似）。
+直觉：当新块里出现更大的 logit 时，旧的指数和与输出都要乘以修正因子 $e^{m^{(t)} - m^{(t+1)}} < 1$ "缩小"——这正是数值稳定 softmax 减去行最大值的在线版本。**全程不需要知道整行的最大值**，因此无需物化 $N \times N$ 矩阵：显存 $O(N)$，且数学上与标准实现**完全等价**（不是近似；只有浮点求和顺序带来的常规数值差异）。
 
 ### 1.4 FlashAttention 的 SRAM 数据流（本周交付图）
 
@@ -160,7 +160,7 @@ def bench(fn, iters=50):
     torch.cuda.synchronize(); return (time.time() - t) / iters * 1e3
 
 t_ref = bench(lambda: ref(x, r, g))
-t_fus = bench(lambda: mod.launch(y_fused, r, g))
+t_fus = bench(lambda: mod.launch(y_fused, r, g, 1e-6))   # 注意 eps 是必填参数
 print(f"PyTorch 两步: {t_ref:.3f} ms | fused: {t_fus:.3f} ms | 加速 {t_ref/t_fus:.2f}x")
 # 预期：加速 1.5-2.5×（纯访存算子，融合收益接近理论 2× 上限）
 ```
@@ -234,7 +234,7 @@ print("融合收益账自检通过 ✓：步数越多、张量越小，融合越
 
 ### 6.1 延伸阅读清单（本周之后）
 
-1. `flash-attn` v2 论文与 `csrc/` 导读：关注"Q 常驻、K/V 流式"的循环交换（比 v1 少一次 HBM 往返）；
+1. `flash-attn` v2 论文与 `csrc/` 导读：关注 v2 的循环交换（外层 Q 块、内层 K/V 流式，Q 常驻 SRAM）——配合并行化改进，把非矩阵乘 FLOPs 与 HBM 往返进一步压低；
 2. vLLM 的 `attention/backends/flash_attn.py`：FlashAttention 在推理引擎里的接线方式（与 PagedAttention 的组合）；
 3. `torch.compile` 生成的 Triton 融合内核（`TORCH_LOGS="output_code"` 查看）：对照第 4 周的 Triton 语法，看自动融合的真实产物。
 

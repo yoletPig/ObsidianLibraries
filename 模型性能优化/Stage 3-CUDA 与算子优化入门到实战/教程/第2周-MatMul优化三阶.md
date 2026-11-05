@@ -113,8 +113,10 @@ using namespace nvcuda;
 
 __global__ void gemm_wmma(const __half* A, const __half* B, float* C, int N) {
     // 每 warp 负责一个 16×16 的输出块；声明 fragment（硬件寄存器布局）
+    // A (M×K) 与 B (K×N) 都按行主序存储 → 两个 fragment 都声明 row_major
+    // （major 声明必须与内存布局一致，否则 mma 结果全错——本周高频踩坑点）
     wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b_frag;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
     wmma::fill_fragment(c_frag, 0.0f);
 
@@ -211,7 +213,8 @@ print(f"cuBLAS: {ms*1e3:.2f} ms, {tflops:.1f} TFLOPS")
 ```python
 # roofline_check.py —— 用第 1 周的 Roofline 给本周三版 MatMul 对账
 def roofline(ai, peak_tflops=19.5, bw_gbs=900.0):
-    """A10G 量级示例：FP32 19.5 TFLOPS、带宽 900 GB/s。返回可达 TFLOPS。"""
+    """演示用参数（非特定卡：19.5 TFLOPS 约为 A100 的 FP32 非张量峰值；
+    带宽取 900 GB/s 作教学演示）。实测时替换为你租的卡的 datasheet 值。"""
     return min(peak_tflops, bw_gbs * ai / 1000)
 
 N = 2048

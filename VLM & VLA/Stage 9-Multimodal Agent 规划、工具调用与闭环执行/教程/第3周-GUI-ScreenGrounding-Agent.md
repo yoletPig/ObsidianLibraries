@@ -34,6 +34,8 @@
 
 **SoM 的失效面**（同样重要）：标记过密时编号拥挤/遮挡 UI（标记本身干扰感知）；元素语义不清时编号选择仍靠模型（SoM 只解决定位不解决语义理解——"哪个是搜索按钮"仍要模型判断）；动态页面标记过期（标记基于旧截图，DOM 已变——必须"截图→标记→决策→执行"原子化，禁止跨轮复用标记）。
 
+> **一句话总结**：SoM 把"模型算不准的连续坐标"换成了"模型最擅长的离散指认"，像素精度由程序兜底——模型负责选对，程序负责点准。
+
 ### 1.3 GUI Agent 的动作空间与安全边界
 
 动作空间（从 Web 到 OS 递增危险等级）：
@@ -125,7 +127,7 @@ def vlm_decide(screenshot_annotated: bytes, elements: list[dict], task: str, his
         if "search" in dl and ("搜索" in low or "search" in low):
             return {"action": "click", "element_id": e["id"]}
     for e in elements:
-        if elements and e["desc"] == "" or "textbox" in e["desc"].lower() or "input" in e["desc"].lower():
+        if "textbox" in e["desc"].lower() or "input" in e["desc"].lower():
             if "输入" in low or "type" in low:
                 return {"action": "type", "element_id": e["id"], "text": "laptop"}
     if history and len(history) >= 2:
@@ -176,9 +178,7 @@ def _offline_check():
     """不启动浏览器的逻辑自检: SoM 标记与决策映射"""
     els = [{"id": 1, "bbox": [10, 10, 60, 40], "center": (35, 25), "desc": "Search"},
            {"id": 2, "bbox": [80, 10, 140, 40], "center": (110, 25), "desc": "textbox"}]
-    shot = som_annotate(b"" or __import__("io").BytesIO(
-        __import__("PIL.Image", fromlist=["Image"]).new("RGB", (200, 60), "white").tobytes()
-    ) if False else _png_stub(), els)
+    shot = som_annotate(_png_stub(), els)
     assert len(shot) > 0, "SoM 标注图生成失败"
     d = vlm_decide(shot, els, "在搜索框输入 laptop 并搜索", history=[])
     assert d["action"] in ("click", "type"), f"决策动作异常: {d}"
@@ -197,10 +197,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--task", default="在搜索框输入 laptop 并搜索")
     ap.add_argument("--url", default="https://demo-playwright.example")   # 换成你的测试站
-    ap.add_argument("--headless", type=bool, default=True)
+    ap.add_argument("--headless", type=str, default="true")               # true/false (bool 类型会被 argparse 当非空字符串)
     args = ap.parse_args()
     _offline_check()
-    history, status = run_gui_agent(args.task, args.url, headless=args.headless)
+    if args.url.endswith(".example"):
+        print("未提供真实 --url (仍是占位域名), 在线浏览器演示已跳过; 离线自检已通过。")
+        raise SystemExit(0)
+    history, status = run_gui_agent(args.task, args.url, headless=args.headless.lower() != "false")
     for h in history:
         print(h["step"], h["decision"], h.get("error", ""))
     print("状态:", status)

@@ -62,7 +62,7 @@ $$
 - **AWQ**（*AWQ: Activation-aware Weight Quantization*, MLSys 2024）：观察"少数关键权重通道对应激活的大值"，量化时对这些通道做缩放保护——**按激活分布加权保护权重**，4-bit 下精度损失远小于朴素 RTN；
 - **GPTQ**（*GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers*, ICLR 2023）：基于二阶信息（Hessian 近似）逐层最小化量化误差，逐列更新补偿；
 - **FP8（W8A8）**：E4M3/E5M2 浮点格式（Stage 2 第 4 周位分配分析的推理版），硬件原生支持（H100/H200），prefill 大 GEMM 直接翻倍吞吐；
-- **SmoothQuant**：把激活的离群值"平滑"迁移到权重上（$\text{act}/s \cdot W \cdot s$ 数学等价变换），使两侧都进入 INT8 可表示范围。
+- **SmoothQuant**：把激活的离群值"平滑"迁移到权重上——对每通道缩放因子 $s$ 做数学等价变换 $X' = X/s,\ W' = W \cdot s$（$X'W' = XW$ 结果不变），使激活落入 INT8 可表示范围、权重侧放大补偿。
 
 选型决策路径：**单请求/低并发、显存是痛 → AWQ-INT4（KV 不量化）；高并发服务、Hopper 卡 → FP8 W8A8 + FP8 KV；长上下文并发 → FP8 KV Cache；消费卡部署大模型 → AWQ/GPTQ-INT4**。
 
@@ -73,7 +73,7 @@ $$
 - **显存**：权重字节按比例降（INT4 ≈ 1/4 of bf16）——账本硬收益，实测必然兑现；
 - **decode 吞吐**：memory-bound 下近似随权重字节比提升（INT4 理论 2~3 倍，实测打折）；
 - **prefill 吞吐**：weight-only 量化几乎无收益（compute-bound）——**没有 prefill 提升却报"整体快 4 倍"的报告可以合上了**；
-- **精度**：必须跑基准回归（AWQ 论文口径的通用任务损失 ~1% 内，但你的领域任务要自己测——Stage 3 评测纪律的应用）。
+- **精度**：必须跑基准回归（AWQ 论文报告 4-bit 下常见基准的精度损失很小（约 1pt 量级），但你的领域任务要自己测——Stage 3 评测纪律的应用）。
 
 ---
 

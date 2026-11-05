@@ -112,7 +112,7 @@ $$
 三个关键论断：
 
 1. **LLM 的 MLP 值得挂**：早期 LoRA 论文只挂 q/v 是在 GLUE 小任务上的结论；后续工作（如 QLoRA 论文的消融）显示对 SFT 类任务，挂上 MLP 的收益显著。现代框架默认 `lora_target: all` 不是偷懒，是消融后的共识。
-2. **Projector 要不要挂**：SFT 阶段 Projector 本来就是解冻全训的（20M 参数直接全量更新，不值得用 LoRA 包裹）。"给 Projector 挂 LoRA"是个伪需求——除非你的 Pipeline 把 Projector 也冻结了（某些只调 LLM 的场景，此时挂上 LoRA 以小幅校准对齐）。
+2. **Projector 要不要挂**：SFT 阶段 Projector 本来就是解冻全训的（量级仅 10~20M：LLaVA-1.5 约 20M、Qwen2-VL-2B 的 merger 约 9M，直接全量更新，不值得用 LoRA 包裹）。"给 Projector 挂 LoRA"是个伪需求——除非你的 Pipeline 把 Projector 也冻结了（某些只调 LLM 的场景，此时挂上 LoRA 以小幅校准对齐）。
 3. **Vision Tower 的默认答案是不挂**（Stage 1 第 6 周已论证冻结理由），例外是**域差距大**时挂顶部若干层的 LoRA——注意是"顶层"，因为 ViT 浅层是通用的边缘/纹理特征，深层才是语义特征；域适配只需要动语义层。
 
 ### 2.3 学习率的适配原则
@@ -122,7 +122,7 @@ $$
 $$
 
 - 全量 SFT：$1 \sim 2 \times 10^{-5}$；LoRA：$1 \times 10^{-4}$；QLoRA 论文发现 4-bit 下可稍大（$1 \sim 2 \times 10^{-4}$）。
-- 不同模块可异构：Projector 是从零/随机初始化的模块（若 Stage 1 未做），需要比 LoRA 更大的 lr（$1 \times 10^{-4} \sim 10^{-3}$）；LLM LoRA 用 $10^{-4}$。LLaMA-Factory 支持 `learning_rate` 分组配置，混冻训练时建议分组。
+- 不同模块可异构：Projector 是从零/随机初始化的模块（若 Stage 1 未做），需要比 LoRA 更大的 lr（$1 \times 10^{-4} \sim 10^{-3}$）；LLM LoRA 用 $10^{-4}$。分组学习率方面，ms-swift 提供 `vit_lr` / `aligner_lr` 参数（视觉塔/对齐模块独立学习率）；LLaMA-Factory 目前是单一 `learning_rate`，需要分组时可分两次训练或自行按参数组拆分。
 
 ---
 
@@ -132,10 +132,10 @@ $$
 
 同一数据集（建议 200~500 条图文指令，构造方法见第 1 周教程）、同一超参（lr $10^{-4}$、3 epoch、bf16、batch 8），仅改可训练参数集合：
 
-| 实验 | 可训练参数 | 实现方式（LLaMA-Factory） |
+| 实验 | 可训练参数 | 实现方式（LLaMA-Factory，底座 Qwen2-VL-2B） |
 | --- | --- | --- |
-| A：仅 Projector | Projector（约 20M） | `finetuning_type: freeze` + `freeze_trainable_modules: multi_modal_projector` + `freeze_vision_tower: true` |
-| B：Projector + LLM LoRA | Projector + LoRA(r=8)（合计约 60M） | `finetuning_type: lora` + `lora_target: all`（Projector 默认解冻） |
+| A：仅 Projector | Merger/Projector（约 9M） | `finetuning_type: freeze` + `freeze_vision_tower: true`（Qwen2-VL 的 Projector 在权重里叫 `visual.merger`，freeze 模式下默认可训；LLaVA 系模块名为 `multi_modal_projector`） |
+| B：Projector + LLM LoRA | Projector + LoRA(r=8)（合计约 19M） | `finetuning_type: lora` + `lora_target: all`（Projector 默认解冻） |
 
 ### 3.2 观测指标与判读
 
@@ -164,7 +164,7 @@ $$
 依赖: torch, transformers (仅加载 config, 不下权重)
 """
 import torch
-from transformers import AutoModelForVision2Seq, AutoConfig
+from transformers import Qwen2VLForConditionalGeneration, AutoConfig
 
 
 def report(model, tag):
@@ -183,21 +183,18 @@ def report(model, tag):
 
 MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
 
-# ---- 实验 A: 仅 Projector ----
-model = AutoModelForVision2Seq.from_config(AutoConfig.from_pretrained(MODEL_ID))
+# ---- 实验 A: 仅 Projector (Qwen2-VL 中 Projector/Merger 位于 visual.merger) ----
+# from_config 只构建随机初始化的骨架, 不下载权重
+model = Qwen2VLForConditionalGeneration.from_config(
+    AutoConfig.from_pretrained(MODEL_ID))
 for p in model.parameters():
     p.requires_grad_(False)
 for n, p in model.named_parameters():
-    if "visual" not in n and "model.layers" not in n and "lm_head" not in n:
-        p.requires_grad_(True)     # 剩余即 Projector/Merger
+    if "visual.merger" in n:
+        p.requires_grad_(True)
 ta = report(model, "A: 仅 Projector")
 
 # ---- 实验 B: Projector + LLM LoRA (用 r=8 估算) ----
-for p in model.parameters():
-    p.requires_grad_(False)
-for n, p in model.named_parameters():
-    if "visual" not in n and "merger" in n or "mlp" in n and "visual" in n:
-        p.requires_grad_(True)     # Projector 部分
 # LoRA 参数量估算: 每个被注入的 Linear 增加两个 r×d 矩阵
 r = 8
 lora_params = 0
@@ -206,16 +203,17 @@ for name, module in model.named_modules():
         d_in, d_out = module.in_features, module.out_features
         lora_params += r * (d_in + d_out)
 print(f"[B: Projector + LoRA] LoRA 注入量估算 ≈ {lora_params/1e6:.1f}M "
-      f"(r={r}, LLM 侧全部 Linear)")
-assert ta < 30e6, "实验 A 的可训练参数应只有 Projector 量级 (~20M)"
+      f"(r={r}, LLM 侧全部 Linear); 加上 Projector ≈ {(lora_params+ta)/1e6:.1f}M")
+assert ta < 30e6, "实验 A 的可训练参数应只有 Projector 量级 (~9M)"
+assert 5e6 < lora_params < 20e6, "LoRA 注入量应约 9M (2B 底座, 28 层)"
 print("✅ 两种策略的参数边界符合预期")
 ```
 
-**预期输出**（估算值，用于规模核对）：
+**预期输出**（估算值，用于规模核对；Qwen2-VL-2B 的 merger = Linear(4×1152→1536)+GELU+Linear(1536→1536) ≈ 9.4M）：
 
 ```text
-[A: 仅 Projector] 可训练 ~23M / 全部 ~2210M (1.05%)  模块分布: {'visual.merger': ...}
-[B: Projector + LoRA] LoRA 注入量估算 ≈ 42M (r=8, LLM 侧全部 Linear)
+[A: 仅 Projector] 可训练 ~9.4M / 全部 ~2210M (0.4%)  模块分布: {'visual.merger': 9.4M}
+[B: Projector + LoRA] LoRA 注入量估算 ≈ 9.2M (r=8, LLM 侧全部 Linear); 加上 Projector ≈ 18.6M
 ✅ 两种策略的参数边界符合预期
 ```
 
@@ -251,7 +249,7 @@ print("✅ 两种策略的参数边界符合预期")
 **失效 2：LoRA 的 `modules_to_save` 漏配导致 Projector 没训**
 - **症状**：实验 B 的效果与预期差距大，接近实验 A。
 - **根因**：某些框架版本中 `finetuning_type: lora` 默认**冻结除 LoRA 外的一切**，Projector 若未被加入 `additional_trainable_parameters`，则实际只训了 LLM 适配器，视觉通道的适配没发生。
-- **定位**：训练日志开头会打印 trainable params 数量——对照 3.3 节的估算值（60M 量级 vs 42M 量级），差一个 Projector 就能看出来。
+- **定位**：训练日志开头会打印 trainable params 数量——对照 3.3 节的估算值（2B 底座下"约 19M（含 Projector）vs 约 9M（纯 LoRA）"），差一个 Projector 就能看出来。
 - **修复**：显式配置 Projector 可训（LLaMA-Factory 的 `freeze_multi_modal_projector: false`）。
 
 **失效 3：两阶段学习率没重置，Stage 2 沿用过大的 lr**

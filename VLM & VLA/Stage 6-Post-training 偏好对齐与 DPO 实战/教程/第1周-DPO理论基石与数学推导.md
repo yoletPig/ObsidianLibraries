@@ -31,7 +31,7 @@ $$
 P(y_w \succ y_l \mid x) = \sigma\big(r(x, y_w) - r(x, y_l)\big)
 $$
 
-（$\sigma$ 是 sigmoid；分差越大，偏好越确定。）它把"相对偏好"转化为对**标量奖励函数**的极大似然估计——注意这个形式，第 1.3 节 DPO 会原样借用它。
+**这个公式在干什么**：人类只告诉我们"谁好谁坏"（二元事件），却要估计连续的奖励——BT 模型是这一步的标准桥梁：把"好回答的分数减坏回答的分数"塞进 sigmoid，映射成"人类选好回答的概率"（分差越大越接近 1）。对一批偏好数据取负对数似然就得到 RM 的训练目标 $\mathcal{L}_{\text{RM}} = -\log \sigma(\Delta r)$——它把"相对偏好"转化为对**标量奖励函数**的极大似然估计。注意这个形式，第 1.3 节 DPO 会原样借用它。
 
 ### 1.2 PPO 的痛点：四个模型的重量与三种崩溃
 
@@ -60,7 +60,7 @@ $$
 \max_{\pi_\theta} \ \mathbb{E}_{x \sim \mathcal{D},\, y \sim \pi_\theta(\cdot|x)} \big[ r^*(x, y) \big] - \beta \, \mathbb{D}_{\mathrm{KL}}\big[ \pi_\theta(y|x) \,\|\, \pi_{\text{ref}}(y|x) \big]
 $$
 
-$\beta > 0$ 控制"向奖励看齐"与"不偏离参考模型"之间的张力。
+$\beta > 0$ 控制"向奖励看齐"与"不偏离参考模型"之间的张力。**这个公式在干什么**：第一项是"得分期望"——鼓励策略生成 RM 打高分的回答；第二项是 KL 惩罚——策略每偏离参考模型（SFT 底座）一分，就扣一分。没有第二项，策略会很快把 RM 的漏洞刷爆（reward hacking）；没有第一项，策略永远停在 SFT。β 决定两股力的配比。
 
 **第二步：求闭式最优解**。这个目标有一个著名的解析解（把 KL 展开成期望差，配方变换）：
 
@@ -69,6 +69,8 @@ $$
 $$
 
 其中 $Z(x) = \sum_y \pi_{\text{ref}}(y|x) \exp(r^*(x,y)/\beta)$ 是配分函数（只依赖 $x$，与 $y$ 无关——记住这点，它是消元的钥匙）。
+
+**为什么 KL 约束下有闭式解（直觉）**：把目标里的 KL 展开成期望差后，问题变成"在概率和为 1 的约束下最大化一个逐 $y$ 的线性函数"——这正是教科书级别的带约束优化，拉格朗日乘子法一步给出：最优分布正比于"参考分布 × 指数化的奖励"。逐符号读：$\pi_{\text{ref}}(y|x)$ 是**底座**（先验，决定"从哪里出发"）；$\exp(r^*/\beta)$ 是**偏好放大器**（奖励越高的回答被指数级放大；$\beta$ 越小放大越狠）；$1/Z(x)$ 是**归一化分母**（保证概率和为 1，且只随 $x$ 变化——同一问题下对 $y_w$、$y_l$ 取值相同）。三个角色分别对应"锚、梯度方向、步长归一"，这就是整个 DPO 的物理图像。
 
 **第三步：反解奖励（隐式奖励的诞生）**。对上式取对数并整理：
 
@@ -97,6 +99,8 @@ $$
 $$
 
 推导链总结（自测考点，要求能默写）：**KL 约束 RL 目标 → 闭式最优解 → 反解出隐式奖励 → 代入 BT 偏好模型 → 差分消 Z(x) → 负对数似然 = DPO 损失**。每一步都是代数操作，没有任何近似——这是 DPO "理论干净"的原因，也是它与后续各种启发式变体（第 2 周）的本质区别。
+
+> **一句话总结**：DPO 的全部魔法是两件事——KL 约束让奖励可以被"对数概率比"精确重参数化（策略即奖励模型），而 Bradley-Terry 的偏好概率只依赖奖励**差值**，使配分函数 $Z(x)$ 在同一问题下被差分消灭；于是训练 RL 策略变成了在偏好对上拟合一个 sigmoid 交叉熵。
 
 ### 1.4 β 的物理意义与动力学
 
@@ -157,24 +161,22 @@ def simpo_loss(policy_chosen_logps: torch.Tensor,
     return loss, chosen, rejected
 
 
-class _ReqGrad(torch.Tensor):
-    pass
-
-
 def _run_tests():
     torch.manual_seed(0)
     B, beta = 16, 0.1
 
-    def make(logp_w, logp_l, ref_gap=2.0):
-        """构造带梯度的 policy logps 与固定 ref logps"""
-        pc = (torch.zeros(B) + logp_w + torch.randn(B) * 0.1).requires_grad_(True)
-        pl = (torch.zeros(B) + logp_l + torch.randn(B) * 0.1).requires_grad_(True)
+    def make(logp_w, logp_l, ref_gap=0.0, noise=0.1):
+        """构造带梯度的 policy logps 与固定 ref logps。
+        noise=0 时输出确定性值——'logits 恰为 0' 的断言必须零噪声, 否则随机
+        扰动会让 loss 偏离 log2 达 0.01 量级, atol=1e-5 的断言必然失败"""
+        pc = (torch.zeros(B) + logp_w + torch.randn(B) * noise).requires_grad_(True)
+        pl = (torch.zeros(B) + logp_l + torch.randn(B) * noise).requires_grad_(True)
         rc = torch.zeros(B) + logp_w + ref_gap            # ref: chosen 比 policy 高 ref_gap
         rl = torch.zeros(B) + logp_l + ref_gap
         return pc, pl, rc, rl
 
     # ---- 测试 1: 初始状态 (policy == ref) 时 loss = -log σ(0) = log 2 ----
-    pc, pl, rc, rl = make(-100.0, -120.0, ref_gap=0.0)
+    pc, pl, rc, rl = make(-100.0, -120.0, ref_gap=0.0, noise=0.0)
     loss, cw, rw, acc = dpo_loss(pc, pl, rc, rl, beta)
     assert torch.isclose(loss, torch.log(torch.tensor(2.0)), atol=1e-5), \
         "policy==ref 时分差应为 0, loss 应为 log2 (DPO 的'零起点'性质)"
@@ -191,9 +193,12 @@ def _run_tests():
     assert (pl.grad > 0).all(), "rejected logp 的梯度应为正 (压低 rejected)"
 
     # ---- 测试 3: margin 增大 => loss 单调下降 ----
+    # 构造方式: 固定 ref, 令 policy 的 rejected logp 随 gap 降低 (分差单调增大)
     prev = float("inf")
     for gap in [0.0, 0.5, 1.0, 2.0, 4.0]:
-        pc, pl, rc, rl = make(-100.0, -120.0 - gap, ref_gap=0.0)
+        pc = torch.full((B,), -100.0).requires_grad_(True)
+        pl = torch.full((B,), -120.0 - gap).requires_grad_(True)
+        rc, rl = torch.full((B,), -100.0), torch.full((B,), -120.0)
         loss, *_ = dpo_loss(pc, pl, rc, rl, beta)
         assert loss.item() < prev, f"margin={gap} 时 loss 未单调下降"
         prev = loss.item()
@@ -205,7 +210,7 @@ def _run_tests():
     assert torch.isclose(cw2, 2 * cw1, atol=1e-4).all(), "奖励应随 beta 线性缩放"
 
     # ---- 测试 5: ref 项必须参与 (去掉 ref 则退化为普通 BT, 无 KL 锚) ----
-    pc, pl, rc, rl = make(-100.0, -120.0, ref_gap=0.0)
+    pc, pl, rc, rl = make(-100.0, -120.0, ref_gap=0.0, noise=0.0)
     loss_no_ref, *_ = dpo_loss(pc, pl, pc.detach(), pl.detach(), beta)  # ref=policy: 恒零分差
     assert torch.isclose(loss_no_ref, torch.log(torch.tensor(2.0)), atol=1e-5)
 
@@ -263,7 +268,7 @@ DPO 并非全面优于 PPO：它把"RM 的质量"问题转化为"**偏好数据�
 - **症状**：训练曲线完美（margin 涨、acc 到 0.9+），但人工评估与 benchmark 全面变差。
 - **根因**：偏好对的 y_l 标注错误（好的被标 rejected）或 y_w/y_l 无实质语义差异（只差标点）——DPO 会忠实地学会错误偏好或无意义偏好。**DPO 没有外部裁判能纠正数据错误**（这正是消掉 RM 的代价）。
 - **定位**：抽 50 条偏好对人工盲评——标注一致率 <85% 时数据不可用；检查 `rewards/accuracies` 是否异常逼近 1.0（太快太满 = 数据可分性过强 = 可能是模板痕迹而非语义差异）。
-- **修复**：数据侧根治（第 3 周的构造方法与对比度校验）；小数据高质量（RLHF-V 用 1.4k 人工细粒度样本超过 10k 粗标数据的 LLaVA-RLHF，已核实 CVPR 2024 报告数字）优于大数据低质。
+- **修复**：数据侧根治（第 3 周的构造方法与对比度校验）；小数据高质量（RLHF-V 用 1.4k 人工段级纠正使幻觉率降低 34.8%，优于用 10k 数据训练的 LLaVA-RLHF——CVPR 2024，arXiv:2312.00849，数字已核实）优于大数据低质。
 
 ---
 

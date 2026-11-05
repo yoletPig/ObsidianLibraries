@@ -39,6 +39,6 @@ Stage 10 的全部内容都在处理一个跨越：**语言的评价标准是"�
 
 ## 文献核实说明
 
-- **OpenVLA**（已核实 arXiv:2406.09246 及官网）：7B 参数开源 VLA，**Prismatic-7B VLM** 微调而来——视觉编码器为 **DINOv2 + SigLIP 双塔融合**，投影层接 **Llama 2 7B** 主干，输出 token 化动作；预训练数据为 **OXE 的 970k 真实机器人 episodes**（64×A100 训练 15 天）；论文口径：29 个任务上以 7×更少参数超过 RT-2-X (55B) **16.5%** 绝对成功率，超过 Diffusion Policy 20.4%；LoRA 微调仅调 **1.4% 参数**即匹敌全量微调，且**只调最后一层或冻结视觉塔效果差**（对第 7-9 周微调策略是关键证据）。学习计划所引标题无误。
+- **OpenVLA**（已核实 arXiv:2406.09246 及官网）：7B 参数开源 VLA，**Prismatic-7B VLM** 微调而来——视觉编码器为 **DINOv2 + SigLIP 双塔融合**，投影层接 **Llama 2 7B** 主干，输出 token 化动作；预训练数据为 **OXE 的 970k 真实机器人 demos**（64×A100 训练 14 天，约 21,500 A100-hours）；论文口径：29 个任务上以 7×更少参数超过 RT-2-X (55B) **16.5%** 绝对成功率，超过 Diffusion Policy 20.4%；LoRA 微调仅调 **1.4% 参数**即匹敌全量微调，且**只调最后一层或冻结视觉塔效果差**（论文消融：BridgeData 示例上 last-layer-only 30.3%、冻结视觉塔 47.0%、全量微调 69.7%；对第 7-9 周微调策略是关键证据）。学习计划所引标题无误。
 - **RT-2**（*RT-2: Vision-Language-Action Models Transfer Web Knowledge to Robotic Control*, 2023）与 **Octo**（*Octo: An Open-Source Generalist Robot Policy*, 2024）所引无误。
-- OXE（Open X-Embodiment）、RLDS、SimplerEnv、ManiSkill 均为真实开源项目；具体数据集字段以所下载版本的文档为准。
+- OXE（Open X-Embodiment，arXiv:2310.08864：22 种机器人本体、21 家机构合作、超 100 万条轨迹）、RLDS、SimplerEnv（CoRL 2024，基于 SAPIEN/ManiSkill2_real2sim：Google Robot 3Hz、Bridge 5Hz 控制频率）、ManiSkill 均为真实开源项目；具体数据集字段以所下载版本的文档为准。

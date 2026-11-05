@@ -74,19 +74,21 @@ serve.run(app)
 ### 2.3 动态批处理
 
 ```python
-from ray.serve import Request
+from starlette.requests import Request
 
 @serve.deployment
 class BatchedLLM:
-    @serve.batch(max_batch_size=16, batch_wait_timeout_s=0.1)
-    async def __call__(self, requests: list):
-        # requests 是攒好的一批（最多 16 个，或等 100ms）
-        prompts = [r["prompt"] for r in requests]
-        results = self.engine.batch_generate(prompts)
-        return results   # 按顺序返回，框架分发给各请求
-
     def __init__(self):
         self.engine = load_vllm_engine("Qwen/Qwen2.5-7B-Instruct")
+
+    @serve.batch(max_batch_size=16, batch_wait_timeout_s=0.1)
+    async def __call__(self, requests: list):
+        # requests 是攒好的一批 Starlette Request 对象（最多 16 个，或等 100ms）
+        # 注意：要逐个 await request.json() 取请求体，不能直接当 dict 用
+        bodies = [await r.json() for r in requests]
+        prompts = [b["prompt"] for b in bodies]
+        results = self.engine.batch_generate(prompts)
+        return results   # 按顺序返回，框架分发给各请求
 ```
 
 **参数权衡**：
@@ -107,6 +109,8 @@ class BatchedLLM:
 ```
 
 当在途请求超过目标，Ray Serve 自动加副本；负载下降再缩回。
+
+> **版本注意**：`target_ongoing_requests` 是较新 Ray Serve 的键名（旧版叫 `target_num_ongoing_requests_per_replica`），写代码时以你安装版本的 `AutoscalingConfig` 文档为准。
 
 ---
 

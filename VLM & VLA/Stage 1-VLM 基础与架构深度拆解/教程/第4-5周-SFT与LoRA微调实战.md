@@ -291,7 +291,7 @@ n_trainable = sum(p.numel() for p in layer.parameters() if p.requires_grad)
 print(f"✅ B=0 初始化等价 | 仅 A/B 可训练 ({n_trainable} 参数) | 更新秩 ≤ 8")
 ```
 
-**预期输出**：`✅ B=0 初始化等价 | 仅 A/B 可训练 (65600 参数) | 更新秩 ≤ 8`。三个断言分别验证 LoRA 的三个关键行为：零起点安全、参数隔离、低秩更新。
+**预期输出**：`✅ B=0 初始化等价 | 仅 A/B 可训练 (65536 参数) | 更新秩 ≤ 8`（A: $r \times d = 8 \times 4096$，B: $d \times r = 4096 \times 8$，共 65536，即正文所说的 65K）。三个断言分别验证 LoRA 的三个关键行为：零起点安全、参数隔离、低秩更新。
 
 ---
 

@@ -139,7 +139,8 @@ class Coder:
     name = "coder"
     def run(self, sub: dict, bus: AgentBus) -> Msg:
         # 真实: Python 沙盒执行 matplotlib/计算; 桩: 确定性结果
-        data = sub.get("payload", {}).get("data", {})
+        # 注意: 依赖结果由 Planner 平铺进 sub (结构化透传, 非 payload 嵌套)
+        data = sub.get("data", {})
         a, b = data.get("chart_a", {}), data.get("chart_b", {})
         growth_a = round((a.get("2024", 0) - a.get("2023", 0)) / max(a.get("2023", 1), 1) * 100, 1)
         growth_b = round((b.get("2024", 0) - b.get("2023", 0)) / max(b.get("2023", 1), 1) * 100, 1)
@@ -152,9 +153,9 @@ class Coder:
 class Reporter:
     name = "reporter"
     def run(self, sub: dict, bus: AgentBus) -> Msg:
-        g = sub.get("payload", {}).get("growth", {})
+        g = sub.get("growth", {})
         md = (f"# 对比报告\n- 报告A X 数据增长率: {g.get('A')}%\n"
-              f"- 报告B X 数据增长率: {g.get('B')}%\n- 图表: {sub['payload'].get('artifacts')}")
+              f"- 报告B X 数据增长率: {g.get('B')}%\n- 图表: {sub.get('artifacts')}")
         open("report.md", "w").write(md)
         return bus.send(Msg(self.name, "planner", "report", {"file": "report.md"}))
 
@@ -173,16 +174,22 @@ class Planner:
     def execute(self, bus: AgentBus, results: dict):
         for sub in self.PLAN:
             needs = sub.get("needs", [])
-            payload = {k: results[k].payload for k in needs if k in results}
+            # 结构化透传: 把依赖结果的 payload 字段平铺进子任务消息 (数字/表格原样传递,
+            # 不经自然语言转述——3.2 失效 2 的"传话失真"防线)
+            flat = {}
+            for k in needs:
+                if k in results:
+                    flat.update({kk: vv for kk, vv in results[k].payload.items()
+                                 if kk not in ("subtask_id", "confidence", "findings")})
             bus.send(Msg("planner", sub["agent"], "subtask",
-                         {"subtask_id": sub["subtask_id"], "goal": sub["goal"], **payload}))
+                         {"subtask_id": sub["subtask_id"], "goal": sub["goal"], **flat}))
             agent = {"vision": VisionExaminer, "coder": Coder, "reporter": Reporter}[sub["agent"]]()
-            msg = agent.run({"subtask_id": sub["subtask_id"], **payload}, bus)
+            msg = agent.run({"subtask_id": sub["subtask_id"], **flat}, bus)
             # 完成谓词判定 (程序审计, 不信模型自报)
             for attempt in range(2):
                 if sub["predicate"](msg):
                     results[sub["subtask_id"]] = msg; break
-                msg = agent.run({**payload, "retry": True}, bus)   # 一次重试
+                msg = agent.run({**flat, "retry": True}, bus)   # 一次重试
             else:
                 results[sub["subtask_id"]] = msg
                 bus.send(Msg("planner", "planner", "report",
@@ -210,14 +217,14 @@ if __name__ == "__main__":
 ✅ Deep Research 闭环通过: 报告 report.md 已生成
 审计日志 (节选):
  planner->vision [subtask] {"subtask_id": "t1", "goal": "解析两份PDF图表区"}
- vision->planner [subtask_result] {"subtask_id": "t1", "findings": "图表数据已提取"...
- planner->coder [subtask] {"subtask_id": "t3", "goal": "计算增长率并绘图", "data": {...}
- coder->planner [subtask_result] {"subtask_id": "t3", "growth": {"A": 40.0, "B": 10.0}...
- reporter->planner [report] {"file": "report.md"}
+ vision->planner [subtask_result] {"subtask_id": "t1", "findings": "图表数据已提取", "data": {"chart_a": {"2023": 120, "2
+ planner->vision [subtask] {"subtask_id": "t2", "goal": "读图表数据点"}
+ vision->planner [subtask_result] {"subtask_id": "t2", "findings": "图表数据已提取", "data": {"chart_a": {"2023": 120, "2
+ planner->coder [subtask] {"subtask_id": "t3", "goal": "计算增长率并绘图", "data": {"chart_a": {"2023": 120, "2024
 # 对比报告
 - 报告A X 数据增长率: 40.0%
 - 报告B X 数据增长率: 10.0%
-- 图表: ['chart_growth.png (A: +40%, B: +10%)']
+- 图表: ['chart_growth.png (A: +40.0%, B: +10.0%)']
 ```
 
 断言验证系统级关键行为：谓词驱动的子任务验收（增长率算错会被打回）、审计日志完整性、产物落盘。**真实化路径**：把三个桩 Agent 换成真 LLM 调用 + 真工具（pdfplumber/PIL/matplotlib），Planner 的 PLAN 换成 LLM 动态生成（谓词由 LLM 提议、程序审核）——骨架与审计纪律不变。

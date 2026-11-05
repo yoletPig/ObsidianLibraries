@@ -25,7 +25,7 @@ DPO 的损失可以"完美"下降（margin 拉开、acc 到 1.0），同时模�
 
 | 超参 | 常用值 | 第一性依据 |
 | --- | --- | --- |
-| **β** | 0.1（DPO）；SimPO 用 β=2~2.5 配 γ=0.5~1.0 | KL 锚定强度（第 1 周 1.4 节）：抑幻场景偏好稳定更新，默认 0.1 |
+| **β** | 0.1（DPO）；SimPO 用 β=2~2.5 配 γ=0.5~1.5（论文推荐区间） | KL 锚定强度（第 1 周 1.4 节）：抑幻场景偏好稳定更新，默认 0.1 |
 | **lr** | **SFT 的 1/10 或更低**（如 5e-7 ~ 5e-6） | 对齐是在"已会说话"的模型上做微小行为修正——大幅权重移动会破坏 SFT 能力（Stage 2 的遗忘机制）；DPO 的梯度天然小（sigmoid 饱和），也容不下大 lr |
 | **epochs** | 1（最多 2） | 偏好数据量小（数百~数千条），多轮必过拟合（第 3 周数据上限决定的） |
 | **gradient clipping** | max_grad_norm = 1.0（标配） | DPO 初期梯度分布与 SFT 不同（rejected 的强推低梯度），裁剪防单 batch 拉飞 |
@@ -61,11 +61,11 @@ model_name_or_path: saves/qwen2vl-2b/sft_merged   # Stage 2 的 SFT 产物
 trust_remote_code: true
 
 ### 方法
-stage: dpo                    # 换 simpo 则改此字段 (LLaMA-Factory: stage: simpo? 以版本文档为准)
+stage: dpo                    # SimPO 不换 stage——仍在 dpo 阶段改 pref_loss 字段
 do_train: true
 finetuning_type: lora
-pref_beta: 0.1                # DPO 的 β
-pref_loss: sigmoid            # dpo 默认; 可选 ipo/kto_pair 等变体
+pref_beta: 0.1                # DPO 的 β (SimPO 时 β 在 2.0~2.5 量级, 与 DPO 的 0.1 不是同一尺度)
+pref_loss: sigmoid            # dpo 默认; 可选值: sigmoid/hinge/ipo/kto_pair/orpo/simpo (以版本文档为准)
 lora_target: all
 lora_rank: 16
 lora_alpha: 32
@@ -112,7 +112,7 @@ FORCE_TORCHRUN=1 llamafactory-cli train qwen2vl_dpo.yaml
 ```python
 """TRL DPOTrainer 骨架 (数据字段更自由时的选择)"""
 from trl import DPOConfig, DPOTrainer
-from transformers import AutoModelForVision2Seq, AutoProcessor
+from transformers import AutoModelForVision2Seq, AutoProcessor   # Qwen2-VL 亦可用 Qwen2VLForConditionalGeneration
 from datasets import load_dataset
 
 MID = "saves/qwen2vl-2b/sft_merged"
@@ -131,7 +131,7 @@ trainer = DPOTrainer(model=model, ref_model=ref, args=cfg,
 trainer.train()
 ```
 
-（多模态列的映射与 `ref_model=None` 的细节随 TRL 版本演进，以所装版本文档为准；两个引擎选一个深度用即可，原理层完全同构。）
+（要点速查：`DPOConfig.loss_type` 支持 `"sigmoid"`（DPO）/`"ipo"`/`"simpo"` 等，SimPO 搭配 `beta≈2.0` 与 `gamma_beta_ratio≈0.5`（γ=0.5·β）；TRL 的多模态 DPO 要求数据为 messages 格式（prompt/chosen/rejected 中含 `{"type": "image"}` 条目，附 `images` 列），具体列名映射与 `ref_model=None`（隐式 ref，省显存但多一倍前向）的细节随 TRL 版本演进，以所装版本文档为准；两个引擎选一个深度用即可，原理层完全同构。）
 
 ### 2.3 抑幻验证：POPE 前后消融
 
@@ -195,7 +195,7 @@ POPE 只测物体存在幻觉；用 Stage 3 第 3 周的完整协议补测属性
 
 **失效 3：评测协议漂移导致"提升"不可比**
 - **症状**：POPE 从 0.84 涨到 0.88，但同事复现只有 0.845。
-- **根因**：前后评测用了不同 VLMEvalKit 版本（PR #1175 改过 MCQ 提取路由）/不同 work-dir 缓存/不同 prompt 模板——Stage 3 第 2 周失效 3 的缓存复用与协议漂移在这里兑现为假提升。
+- **根因**：前后评测用了不同 VLMEvalKit 版本（评测框架迭代会改动 prompt 模板/答案提取逻辑，分数不可跨版本比较）/不同 work-dir 缓存/不同 prompt 模板——Stage 3 第 2 周失效 3 的缓存复用与协议漂移在这里兑现为假提升。
 - **定位**：核对两次评测的框架 commit、work-dir 新旧、预测文件 hash。
 - **修复**：前后评测**必须同环境同协议同日跑完**；报告里永久绑定协议四要素（框架版本/裁判/提取器/失败率）。
 

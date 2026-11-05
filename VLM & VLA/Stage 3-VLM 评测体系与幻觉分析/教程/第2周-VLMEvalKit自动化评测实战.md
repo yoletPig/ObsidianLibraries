@@ -24,7 +24,7 @@
 
 ### 1.2 VLMEvalKit 的架构分层
 
-（接口与机制已对照 `open-compass/VLMEvalKit` main 分支核实，2026 年持续维护，220+ 模型、80+ 基准。）
+（接口与机制已对照 `open-compass/VLMEvalKit` main 分支核实；支持的模型与基准数量随版本增长，README 口径为 200+ 模型、80+ 基准。）
 
 ```text
 run.py (CLI 入口: --model --data --verbose --work-dir --nproc ...)
@@ -102,8 +102,9 @@ export OPENAI_API_BASE=https://xxx/v1
 
 ```bash
 # Qwen2.5-VL-7B: MME + POPE (vLLM 加速)
+# 注意: --model 用框架注册名 (config.py 中的 key), 不确定时先跑 python run.py --model list
 python run.py \
-  --model qwen2.5_vl_7b \
+  --model Qwen2.5-VL-7B-Instruct \
   --data MME POPE \
   --work-dir outputs/qwen25vl7b \
   --nproc 2 --verbose
@@ -136,14 +137,18 @@ outputs/qwen25vl7b/
 对比两模型在 MME 子任务与 POPE 上的得分, 输出柱状图。
 运行方式: python stage3_week2_compare.py
 依赖: matplotlib, pandas
+注: 两个 acc.csv 的列结构以实际产出为准 (列名随版本可能微调),
+    运行前先 print(df.columns) 确认; 下面按现行 main 分支的格式读取。
 """
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# MME_acc.csv 为 长表: columns = [category, split, score]
-# POPE_acc.csv 为 宽表: columns = [split, f1, accuracy, precision, recall, yes_ratio]
-MME_KEY_TASKS = ["existence", "count", "position", "color",  # 感知-细粒度
-                 "code_reasoning", "numeric_calculation",     # 认知-推理
+# MME_acc.csv 为单行宽表: 每个子任务一列, 取值为该子任务的 acc + acc+
+# 子任务名以现行实现为准: 感知 = existence/count/position/color/OCR/posters/
+#   scene/landmark/artwork/celebrity; 认知 = code_reasoning/
+#   commonsense_reasoning/numerical_calculation/text_translation
+MME_KEY_TASKS = ["existence", "count", "position", "color",       # 感知
+                 "code_reasoning", "numerical_calculation",       # 认知
                  "text_translation", "posters"]
 
 
@@ -153,13 +158,14 @@ def load_scores(qwen_dir: str, llava_dir: str) -> pd.DataFrame:
         mme = pd.read_csv(f"{d}/MME/MME_acc.csv")
         pope = pd.read_csv(f"{d}/POPE/POPE_acc.csv")
         for task in MME_KEY_TASKS:
-            row = mme[mme["category"] == task]
-            if len(row):
+            if task in mme.columns:
                 rows.append({"model": name, "task": task,
-                             "score": float(row["score"].iloc[0])})
-        # POPE 三种采样取 F1 均值作为单一画像点
+                             "score": float(mme[task].iloc[0])})
+        # POPE_acc.csv 为多行长表: 列 = [split, Overall, acc, precision, recall]
+        # 其中 Overall 列即 F1 (x100); 对三种采样 (adversarial/popular/random) 取均值
         rows.append({"model": name, "task": "POPE(F1 avg)",
-                     "score": float(pope["f1"].mean())})
+                     "score": float(pd.to_numeric(pope["Overall"],
+                                                  errors="coerce").mean())})
     return pd.DataFrame(rows)
 
 
@@ -170,8 +176,8 @@ if __name__ == "__main__":
 
     ax = pivot.plot(kind="bar", figsize=(12, 5), width=0.75)
     ax.set_title("MME 子任务与 POPE: Qwen2.5-VL-7B vs LLaVA-1.5-7B")
-    ax.set_ylabel("score / F1")
-    ax.set_ylim(0, 100)
+    ax.set_ylabel("score (MME 子任务满分 200; POPE F1 满分 100)")
+    ax.set_ylim(0, 200)
     plt.xticks(rotation=30, ha="right")
     plt.tight_layout()
     plt.savefig("stage3_week2_compare.png", dpi=150)

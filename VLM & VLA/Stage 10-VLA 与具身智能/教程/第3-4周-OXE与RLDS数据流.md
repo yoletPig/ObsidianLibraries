@@ -13,10 +13,10 @@
 
 ### 1.1 根本矛盾：机器人数据的"孤岛经济学"
 
-Stage 1 的 VLM 之所以可行，是因为互联网图文数据足够大且格式统一。机器人数据的现状曾经相反：**每个实验室一套机器人、一套坐标系、一套数据格式**——孤岛数据无法汇成规模。Open X-Embodiment（OXE，Google DeepMind 联合 30+ 机构，已核实仓库 `google-deepmind/open_x_embodiment`）的贡献是把这条路径走通：
+Stage 1 的 VLM 之所以可行，是因为互联网图文数据足够大且格式统一。机器人数据的现状曾经相反：**每个实验室一套机器人、一套坐标系、一套数据格式**——孤岛数据无法汇成规模。Open X-Embodiment（OXE，arXiv:2310.08864，Google DeepMind 联合 21 家机构，已核实仓库 `google-deepmind/open_x_embodiment`）的贡献是把这条路径走通：
 
-- **多本体（Embodiments）**：数十种机器人（Google Robot、Franka、WidowX、ALOHA、移动机械臂等）；
-- **百万级轨迹**：OpenVLA 预训练用了其中 **970k episodes**（已核实）；
+- **多本体（Embodiments）**：**22 种**机器人本体（论文口径；Google Robot、Franka、WidowX、ALOHA、移动机械臂等）；
+- **百万级轨迹**：OXE 整体超 **100 万条**真实机器人轨迹（论文口径 1M+）；OpenVLA 预训练用了其中 **970k episodes**（已核实）；
 - **统一格式**：RLDS（TFDS 生态）+ 统一动作空间约定（各数据集变换到可比较的表示）。
 
 "ImageNet 时刻"的类比要精确：ImageNet 对视觉的意义是"**统一的监督信号来源催生了预训练-微调范式**"——OXE 对具身的意义相同：**OpenVLA/Octo 预训练于 OXE，你的任务是微调**（第 7-9 周）。Stage 4 的"数据分布决定上限"在具身语境的具体化：OXE 覆盖的任务/本体分布，决定了通用 VLA 的能力边界。
@@ -34,18 +34,21 @@ Dataset (按 shard 分文件)
     │         │    ├── image / wrist_image      (主视角 / 手腕相机, H×W×3 uint8)
     │         │    ├── state / joint_position   (本体感受: 关节角/末端位姿)
     │         │    └── (各数据集字段略有差异)
-    │         ├── action: [7] float32           (下一帧动作, 已归一化 [-1,1])
-    │         ├── language_instruction: str     (如 "pick up the coke can")
+    │         ├── action: [7] float32           (下一帧动作, 已归一化 [-1,1];
+    │         │                                 原始字段可能是嵌套 dict——fractal 即如此,
+    │         │                                 由 per-dataset 适配层统一为 [7])
+    │         ├── language_instruction: str     (如 "pick up the coke can";
+    │         │                                 fractal 里叫 natural_language_instruction)
     │         └── is_first / is_last / is_terminal: bool (轨迹边界标记)
     └── episode_metadata: {file_path, ...}
 ```
 
 四个必须建立的工程直觉：
 
-1. **`steps` 是惰性 Dataset 不是 list**——直接 `len()` 会失败；遍历即触发读取（TTFD 数据流）；
+1. **`steps` 是惰性 Dataset 不是 list**——直接 `len()` 会失败；遍历即触发读取（TFDS 数据流）；
 2. **`action[t]` 是"从观察 $o_t$ 出发的下一步动作"**——对齐关系是 $o_t \to a_t \to o_{t+1}$（off-by-one 是 RLDS 处理的头号 bug 源）；
 3. **图像是原始 uint8**，模型输入的 resize/归一化在训练管线做（Stage 2 的 Processor 职责）；
-4. **字段名跨数据集有差异**（`image` vs `image_primary`、`state` vs `robot_state`）——OXE 联合训练靠的是每数据集一个 transform 适配层（OpenVLA 代码里可见），自研管线同理需要 per-dataset 适配。
+4. **字段名与动作结构跨数据集有差异**——例如 `fractal20220817_data` 的原始 `action` 是**嵌套 dict**（`world_vector (3,)` + `rotation_delta (3,)` + `gripper_closedness_action (1,)` + base 相关 3 维 + `terminate_episode (3,)`），语言字段叫 `natural_language_instruction`；OpenVLA 的 per-dataset transform 把它平铺成 7-DoF（3 平移 + 3 旋转 + 1 夹爪，丢弃 base 与 terminate 维）。OXE 联合训练靠的就是每数据集一个 transform 适配层（OpenVLA 代码里可见），自研管线同理需要 per-dataset 适配。
 
 ---
 
@@ -83,6 +86,28 @@ def to_np(x):
     return x
 
 
+def to_action_vec(action) -> np.ndarray:
+    """per-dataset 适配层: 原始 action 结构跨数据集差异巨大。
+    fractal20220817_data 的 action 是嵌套 dict——按 OpenVLA 的 transform
+    平铺为 7-DoF: world_vector(3) + rotation_delta(3) + gripper_closedness(1)
+    (丢弃 base 位移与 terminate 维); 已是数组的则原样 ravel。"""
+    if isinstance(action, dict):
+        return np.concatenate([
+            np.asarray(to_np(action["world_vector"])).ravel(),
+            np.asarray(to_np(action["rotation_delta"])).ravel(),
+            np.asarray(to_np(action["gripper_closedness_action"])).ravel(),
+        ]).astype(np.float32)
+    return np.asarray(to_np(action), dtype=np.float32).ravel()
+
+
+def get_instr(step) -> str:
+    """语言字段别名适配 (language_instruction / natural_language_instruction)"""
+    for k in ("language_instruction", "natural_language_instruction"):
+        if k in step:
+            return to_np(step[k])
+    raise KeyError(f"无语言指令字段, 实际字段: {list(step.keys())}")
+
+
 def episode_frames(ep, max_frames=200):
     """把一条 Episode 拉平成 [(img, action, instr), ...] (steps 是惰性流)"""
     frames = []
@@ -90,8 +115,8 @@ def episode_frames(ep, max_frames=200):
         if i >= max_frames:
             break
         img = to_np(step["observation"]["image"])
-        act = to_np(step["action"]).astype(np.float32)
-        instr = to_np(step["language_instruction"])
+        act = to_action_vec(step["action"])
+        instr = get_instr(step)
         frames.append((img, act, instr))
     return frames
 
@@ -126,9 +151,9 @@ def main():
     args = ap.parse_args()
 
     ds, info = load_rlds(args.dataset)
-    # 打印数据集结构 (RLDS 自省: 字段名跨数据集有差异, 先自省再取字段)
+    # 打印数据集结构 (RLDS 自省: 字段名/结构跨数据集有差异, 先自省再取字段)
     print("observation 字段:", list(info.features["steps"]["observation"].keys()))
-    print("action shape:", info.features["steps"]["action"].shape)
+    print("action 字段:", info.features["steps"]["action"])   # fractal 为嵌套 dict, 经适配层平铺为 (7,)
 
     n = 0
     for ep in ds.take(args.episodes):                 # take(5) 只读 5 条 (惰性优势)
@@ -154,14 +179,14 @@ if __name__ == "__main__":
 **预期输出形态**：
 
 ```text
-observation 字段: ['image', 'wrist_image', 'state', ...]
-action shape: (7,)
+observation 字段: ['image', 'natural_language_instruction', 'base_pose_tool_reached', 'gripper_closed', ...]
+action 字段: 嵌套 dict (world_vector/rotation_delta/gripper_closedness_action/...) -> 适配后 (7,)
 Episode 0: 87 帧 | 指令: pick up the coke can | a[0]: [-0.012 0.031 0.988]
 ...
 ✅ 已渲染 5 条 Episode -> episode_0..4.mp4
 ```
 
-断言验证数据管线的四个正确性基点：图像 dtype/布局、动作 7-DoF 与归一化区间（第 1-2 周 tokenizer 的输入前提）、语言指令存在、Episode 帧数合理。**`take(5)` 的惰性读取**保证了"只下载/解析 5 条"的效率——RLDS 流式设计的直接收益。
+断言验证数据管线的四个正确性基点：图像 dtype/布局、动作 7-DoF 与归一化区间（第 1-2 周 tokenizer 的输入前提；注意这是**适配层输出**的口径——fractal20220817_data 的原始 action 是嵌套 dict，须先经 `to_action_vec` 平铺）、语言指令存在、Episode 帧数合理。**`take(5)` 的惰性读取**保证了"只解析 5 条"的效率——RLDS 流式设计的直接收益（注：fractal 全量数据集 111 GiB，首次运行会按需下载 shard，磁盘与网络请预留余量）。
 
 ### 2.2 自省优先的字段适配
 
@@ -191,7 +216,7 @@ def get_field(obs: dict, canonical: str):
 
 | 目标 | 选什么数据 |
 | --- | --- |
-| 通用抓取微调 | 与目标本体同款的数据（fractal=Google Robot / bridge=WidthX / DROID=Franka） |
+| 通用抓取微调 | 与目标本体同款的数据（fractal=Google Robot / bridge=WidowX（Bridge V2） / DROID=Franka） |
 | 语言接地强化 | 多任务多物体的数据集（语言指令多样性高） |
 | 空间精度强化 | 高质量坐标类数据（+ Stage 4 合成的空间 GT，第 7-9 周） |
 | 防遗忘回放 | OXE 原始混合子集（第 7-9 周 Co-finetuning） |

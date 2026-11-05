@@ -82,6 +82,7 @@ $$
 
 ```python
 # inspect_gguf.py —— 用法：python inspect_gguf.py model.gguf
+# （Reader 字段访问方式随 gguf-py 版本略有差异，以你安装版本的 API 为准）
 import sys
 from gguf import GGUFReader
 

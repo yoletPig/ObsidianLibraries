@@ -25,24 +25,37 @@ $$
 \text{KV bytes} = 2 \times n_{\text{layers}} \times n_{\text{kv\_heads}} \times d_{\text{head}} \times L \times \text{bytes\_per\_elem}
 $$
 
-- 系数 2：K 和 V 各一份；
-- $n_{\text{kv\_heads}}$：GQA（Grouped Query Attention）下 KV 头数 < Q 头数，这是省显存的关键；
-- $d_{\text{head}}$：每头维度；
-- `bytes_per_elem`：FP16=2，FP8=1。
+#### 深入拆解：这个公式在干什么
 
-**实例：Qwen2.5-7B**（32 层、GQA 8 个 KV 头、head_dim=128）：
+> 这个公式回答一个问题："每多存一个 token 的历史，我要在显存里多花多少字节？"它是后面一切并发/上下文容量估算的地基。
+
+- **为什么需要它**：规划并发与上下文长度时，你必须先知道 KV 的"单价"（每 token 多少字节），才能算出给定显存能同时养多少请求（交付物②就靠它）；
+- **系数 2**：注意力里 K 和 V 是两组独立的张量，各存一份；
+- **$n_{\text{layers}}$**：每一层都有独立的注意力、都要存自己的 K/V，层数越多 KV 越大；
+- **$n_{\text{kv\_heads}} \times d_{\text{head}}$**：K/V 每层的"宽度"。GQA（Grouped Query Attention）下 KV 头数远小于 Q 头数——多个 Q 头共享一组 KV 头，这正是省显存的关键（Q 不进 cache，不用管）；
+- **$L$**：序列长度，KV 与它**线性增长**；
+- **`bytes_per_elem`**：存储精度，FP16=2 字节、FP8=1 字节；
+- **结果拿来做什么**：乘上 batch 与序列长度就是总 KV 显存 → 反推"这块卡最多扛多少并发/多长上下文"。
+
+**手算小例**：假设一个只有 2 层、2 个 KV 头、head_dim=2 的小玩具模型，存 1 个 token 的 FP16 KV：$2 \times 2 \times 2 \times 2 \times 2 = 64$ 字节。真实模型只是把这个乘法换成大数字而已。
+
+**实例：Qwen2.5-7B**（以官方 `config.json` 为准：**28 层、GQA 4 个 KV 头、head_dim=128**，由 hidden_size 3584 / 28 个 Q 头 = 128 得出）：
 
 $$
-\text{每 token KV} = 2 \times 32 \times 8 \times 128 = 65536 \text{ 元素/token}
+\text{每 token KV 元素数} = 2 \times 28 \times 4 \times 128 = 28672 \text{ 元素/token}
 $$
 
-FP16 下 $65536 \times 2 = 131072$ 字节 $\approx 128$ KB/token。
+FP16 下 $28672 \times 2 = 57344$ 字节 $= 56$ KB/token。
 
-**8k 上下文、单请求**：$128 \text{ KB} \times 8192 = 1$ GB。
+**8k 上下文、单请求**：$56 \text{ KB} \times 8192 = 448$ MB。
 
-**batch=32、8k**：$32 \times 1$ GB = **32 GB**。
+**batch=32、8k**：$32 \times 448 \text{ MB} = 14$ GB。
 
-对比：7B 权重本身（FP16）才 14 GB。**KV cache（32 GB）远超权重（14 GB）**——这就是"长上下文时代 KV 是显存第一杀手"的定量证明。若换 FP8（元素减半），降到 16 GB，直接决定单卡能扛多少并发。
+对比：7B 权重本身（FP16）约 14 GB。**batch=32、8k 时 KV cache（14 GB）已与权重（14 GB）相当**；上下文再翻倍、或并发再翻倍，KV 就会**超过权重**——这就是"长上下文时代 KV 是显存第一杀手"的定量直觉：权重是固定开销，KV 随 batch × 序列长度线性膨胀。若换 FP8 KV（元素减半），并发上限直接翻倍，决定单卡能扛多少请求。
+
+> **动手验证**：`python -c "from transformers import AutoConfig; c = AutoConfig.from_pretrained('Qwen/Qwen2.5-7B-Instruct'); print(c.num_hidden_layers, c.num_key_value_heads, c.hidden_size // c.num_attention_heads)"` 输出 `28 4 128`。**算 KV 必须以目标模型 config 为准**——层数、KV 头数随模型型号差异巨大，不要背某个模型的数字。
+
+> **一句话总结**：KV 单价 = 2（K、V）× 层数 × KV 头数 × 头维度 × 字节数；Qwen2.5-7B FP16 下每 token 约 56 KB，8k 上下文单请求 448 MB，batch=32 时 KV 已追平权重——并发与上下文任一翻倍，KV 就反超权重成为显存大头。
 
 ---
 
@@ -209,6 +222,8 @@ $$
 
 新请求的前缀块若能命中已有哈希，就直接复用物理块（引用计数 +1），跳过重复的 prefill 计算。逐出用 LRU。
 
+> **版本注意**：V1 引擎（约 v0.8.x 起）中 prefix caching（官方叫 Automatic Prefix Caching，APC）**默认开启**——不再需要 `--enable-prefix-caching`；要关掉用 `--no-enable-prefix-caching`。部分模型（如 Mamba/混合架构）不支持，默认仍关闭。
+
 ### 3.2 RadixAttention（SGLang）
 
 SGLang 用 **Radix Tree（基数树）** 组织所有缓存的前缀：
@@ -225,7 +240,7 @@ SGLang 用 **Radix Tree（基数树）** 组织所有缓存的前缀：
 
 ### 4.1 为什么压 KV
 
-第 1.2 节算过，长上下文下 KV 远超权重。压缩 KV 直接放大并发：
+第 1.2 节算过，长上下文下 KV 会逼近甚至反超权重。压缩 KV 直接放大并发：
 
 - **FP8 KV**：元素 2 字节 → 1 字节，KV 减半，精度损失小（KV 数值范围比权重窄）；
 - **KIVI**：Key 用 2-bit、Value 用 2-bit 的极端量化（Key 沿通道量化、Value 沿时间量化）；
@@ -256,8 +271,8 @@ SGLang 用 **Radix Tree（基数树）** 组织所有缓存的前缀：
 
 ## 6. 延伸思考题（含解析）
 
-**Q1**：手算 7B、8k、batch=32 的 KV 显存，并说明为什么它超过权重。
-**A**：每 token KV = 2×32 层×8 KV 头×128 维 = 65536 元素，FP16 约 128 KB；8k × 32 = 32 GB，而 7B 权重仅 14 GB。KV 随序列长度与并发线性增长，权重固定，故长上下文高并发下 KV 远超权重。
+**Q1**：手算 7B、8k、batch=32 的 KV 显存，并说明它如何逼近权重。
+**A**：以 Qwen2.5-7B 官方 config（28 层、4 KV 头、head_dim=128）为例：每 token KV = 2×28×4×128 = 28672 元素，FP16 约 56 KB；8k 上下文单请求 448 MB，×32 = 约 14 GB，与 7B 权重（约 14 GB）相当。KV 随序列长度与并发线性增长，权重固定，故上下文或并发再翻倍，KV 即反超权重成为显存大头。
 
 **Q2**：PagedAttention 相比预分配，显存利用率为什么能逼近 100%？
 **A**：预分配按最大上下文整段预留，短请求浪费巨大（内部碎片）；PagedAttention 按需分页，浪费最多是最后一块的尾部（<16 token），碎片从"整段"降到"一块尾部"。
@@ -277,5 +292,6 @@ SGLang 用 **Radix Tree（基数树）** 组织所有缓存的前缀：
 
 - [ ] 跑通迷你块管理器，验证分配/写时复制/引用计数断言。
 - [ ] 画块占用时间线，标注并发峰值波谷。
-- [ ] 闭卷手算 7B/8k/batch=32 的 KV 显存（32 GB），与权重对比。
+- [ ] 闭卷手算 7B/8k/batch=32 的 KV 显存（Qwen2.5-7B 约 14 GB），与权重对比。
+- [ ] 用 `AutoConfig` 验证你所用模型的层数/KV 头数/头维度，确认手算输入无误。
 - [ ] 云上实测 `--max-num-seqs` 与手算并发对照（误差 < 20%）。

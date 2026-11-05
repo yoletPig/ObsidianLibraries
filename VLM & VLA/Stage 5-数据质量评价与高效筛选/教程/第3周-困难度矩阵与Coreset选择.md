@@ -41,7 +41,7 @@ DEITA（已核实：*What Makes Good Data for Alignment? A Comprehensive Study o
 - **倒数第二层 hidden state**（回答区 Token 的平均池化）：它是 LLM 对样本"理解"的内部编码，比 CLIP 更贴近"训练动力学的相似性"——两个在该空间中靠近的样本，对模型的影响也更相似（XMAS 等工作证明了注意力/隐层特征与梯度影响的关联，arXiv:2510.01454）。
 - 高维（4k）不能直接聚类（维度灾难：距离集中效应），先 **PCA 降到 64~128 维**，保留主要方差方向。
 
-两个覆盖算法的分工：
+两个覆盖算法的分工（K-Means 在做的事，一句话：给每个样本找一个"最近的簇中心"，再反过来把中心挪到簇内均值——交替两步使簇内平方距离 $\sum_c \sum_{i \in c} \|x_i - \mu_c\|^2$ 变小，收敛后每个簇就是一个语义区域；FPS 在做的事，一句话：先随机选一个点，之后每轮都选"离已选集合最远的点"，贪心地撑开覆盖半径）：
 
 | 算法 | 保证 | 复杂度 | 适用 |
 | --- | --- | --- | --- |
@@ -67,6 +67,11 @@ K-Means 的簇天然对应"任务/领域"（无需人工标注的任务边界）
 import argparse
 import json
 import numpy as np
+import torch          # @torch.no_grad() 装饰器在模块加载时求值, 必须顶层导入
+
+
+def load_jsonl(path):
+    return [json.loads(l) for l in open(path)]
 
 
 # ---------- 第一阶段: NLL 两端截断 ----------
@@ -85,7 +90,8 @@ def stage1_filter(scores_path, drop_high=0.05, drop_low=0.20):
 # ---------- 第二阶段特征: 倒数第二层 hidden state ----------
 @torch.no_grad()
 def extract_penult_embeddings(rows, model, processor, device):
-    """回答区最后一 Token 的倒数第二层 hidden state 作为样本表示"""
+    """序列末位 (回答末 Token / EOS, 含 chat 模板) 的倒数第二层 hidden state 作为样本表示。
+    更稳健的做法是对回答区 Token 做 mean-pooling, 见失效模式 1"""
     embs = []
     for i in range(0, len(rows), 4):                      # 小批
         batch = rows[i:i + 4]
@@ -154,9 +160,9 @@ def main():
         model = Qwen2VLForConditionalGeneration.from_pretrained(
             MID, torch_dtype=torch.bfloat16).to(device).eval()
         processor = AutoProcessor.from_pretrained(MID)
-        rows = {id(r): r for r in json.load(open(args.data))}
+        rows = load_jsonl(args.data)
         # 与 scores 对齐: scores 保留了 question 作为键
-        q2row = {r["question"]: r for r in json.load(open(args.data))}
+        q2row = {r["question"]: r for r in rows}
         rows_ord = [q2row[r["question"]] for r in kept]
         embs = extract_penult_embeddings(rows_ord, model, processor, device)
         np.save("embs.npy", embs)
@@ -180,7 +186,7 @@ def main():
         from collections import Counter
         cnt = Counter(labels[i] for i in chosen)
         assert len(cnt) == args.clusters and min(cnt.values()) >= 1, "存在空簇, 多样性失败"
-        q2row = {r["question"]: r for r in json.load(open(args.data))}
+        q2row = {r["question"]: r for r in load_jsonl(args.data)}
         with open(args.out, "w") as f:
             for i in chosen:
                 f.write(json.dumps(q2row[kept[i]["question"]], ensure_ascii=False) + "\n")

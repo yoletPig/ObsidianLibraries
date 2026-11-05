@@ -66,19 +66,21 @@ $$
 \mathcal{L}_{\text{GRPO}}(\theta) = -\frac{1}{G}\sum_{i=1}^{G} \min \left( \rho_i A_i,\ \text{clip}(\rho_i, 1-\epsilon_{\text{clip}}, 1+\epsilon_{\text{clip}}) A_i \right) + \beta\, D_{\text{KL}}(\pi_\theta \parallel \pi_{\text{ref}})
 $$
 
+**这个公式在干什么**：它把"让高优势回答的概率变高、低优势回答变低"这件事，套上两道保险再求平均。第一项 $-\min(\cdots)$ 是 PPO 的截断代理损失——$\min$ 在"未截断"与"已截断"两个分支里取小的那个，保证策略一旦偏离旧策略太远（$\rho$ 出 $[1-\epsilon, 1+\epsilon]$）就不再获得继续推高/压低该方向的梯度；第二项 $\beta D_{\text{KL}}$ 是拉回参考模型的弹簧。梯度下降最小化这个损失，等价于在"提高组内相对优势"与"不跑离 SFT 太远"之间做带约束的折中。注意口径：DeepSeekMath 原文是 **Token 级**目标（$\frac{1}{G}\sum_i \frac{1}{|o_i|}\sum_t$，clip 与 KL 都逐 Token 施加），本文为教学简化成序列级表述，机制一致。
+
 其中 $\rho_i = \frac{\pi_\theta(o_i \mid q)}{\pi_{\text{old}}(o_i \mid q)}$ 是重要性采样比（**on-policy 多轮更新**下，$\pi_{\text{old}}$ 是本 batch 采样时的旧策略，同一批数据多次 mini-batch 更新时 $\rho \neq 1$）。
 
 两个稳定机制的分工：
 
 - **clip（$\epsilon_{\text{clip}}$，常取 0.2）防单步过冲**：当 $\rho$ 超出 $[1-\epsilon, 1+\epsilon]$，min 取被截断的分支——对"把概率推得过远的方向"，梯度被冻结。直觉：RL 更新依据的是**旧策略采样出的经验**，若一步把策略改得太狠，新策略下的估计就失真了（off-policy 误差）。clip 是"信任域"的廉价实现。
-- **$\beta D_{KL}$（KL 正则）防长期漂移**：clip 只管单次更新的幅度，管不住多步累积的漂移方向。KL 项把 $\pi_\theta$ 锚在 $\pi_{\text{ref}}$（SFT 模型）附近——与 DPO 的 β 完全同源（Stage 6 第 1 周的 KL 约束目标）。DeepSeekMath 的工程细节：其 KL 用无偏估计器 $D_{KL} \approx \frac{\pi_{\text{ref}}(y|q)}{\pi_\theta(y|q)} - \log\frac{\pi_{\text{ref}}(y|q)}{\pi_\theta(y|q)} - 1$（k3 估计量），避免了对数项的有偏估计。
+- **$\beta D_{KL}$（KL 正则）防长期漂移**：clip 只管单次更新的幅度，管不住多步累积的漂移方向。KL 项把 $\pi_\theta$ 锚在 $\pi_{\text{ref}}$（SFT 模型）附近——与 DPO 的 β 完全同源（Stage 6 第 1 周的 KL 约束目标）。注意 GRPO 与 PPO 的一个实现差异：**KL 直接加进损失**（而非像 PPO 那样折进奖励）。DeepSeekMath 的工程细节：其 KL 用 Schulman 提出的无偏估计器 $D_{KL} \approx \frac{\pi_{\text{ref}}(y|q)}{\pi_\theta(y|q)} - \log\frac{\pi_{\text{ref}}(y|q)}{\pi_\theta(y|q)} - 1$（k3 估计量）——它对 $\pi_\theta$ 采样是 KL 的无偏估计，且逐点恒非负（$r - \log r - 1 \ge 0$，$r=\pi_{\text{ref}}/\pi_\theta$），比朴素 $\log\frac{\pi_\theta}{\pi_{\text{ref}}}$ 的采样估计方差更小、不会出现负的"KL"。DeepSeekMath 实验中 $\beta=0.04$。
 
 ### 1.5 GRPO 与 PPO/DPO 的系统对照
 
 | 维度 | PPO | DPO | GRPO |
 | --- | --- | --- | --- |
 | Critic | 需要学习的价值网络 | 无 | **无（组均值当基线）** |
-| Ref 模型 | 有 | 有 | 有（KL 正则；部分变体如 Dr.GRPO/DAPO 探讨去除） |
+| Ref 模型 | 有 | 有 | 有（KL 正则；DAPO 等变体实证可整项去除 KL，从而连 $\pi_{\text{ref}}$ 一起省掉） |
 | 数据 | 在线采样 | 离线偏好对 | **在线采样 + 组内对比** |
 | 优势信号 | $A_t = R_t - V(s_t)$（GAE） | 隐含在配对分差 | $A_i = (r_i - \bar{r})/(\sigma_r + \epsilon)$ |
 | 适用 | 通用 RL（有过程奖励） | 有偏好对、无环境 | **可验证结果奖励、可批量采样** |
@@ -200,7 +202,7 @@ if __name__ == "__main__":
 | --- | --- | --- |
 | 组大小 $G$ | 4~16（DAPO 动态采样场景更高） | 大 → 基线更稳、更贵（采样成本 ×G）；小 → std 估计噪声大 |
 | $\epsilon_{\text{clip}}$ | 0.2 | 小 → 更保守、训练慢；大 → 单步过冲风险 |
-| KL 系数 $\beta_{KL}$ | 0 ~ 0.01 量级（RLVR 中常很小甚至 0） | 大 → 锚死探索；0 → 依赖 clip 与奖励设计（DAPO 实证可去 KL，但需要更强的其他稳定机制） |
+| KL 系数 $\beta_{KL}$ | 0 ~ 0.04 量级（DeepSeekMath 用 0.04；DAPO 式 RLVR 中常直接置 0） | 大 → 锚死探索；0 → 依赖 clip 与奖励设计（DAPO 实证可去 KL，但需要更强的其他稳定机制） |
 | lr | ~1e-6 量级 | RL 对 lr 比 SFT 敏感；与 G、clip 联动 |
 | 采样 temperature | 0.7~1.2 | 高 → 组内多样性大（有信号组多）；过高 → 乱码轨迹浪费算力 |
 

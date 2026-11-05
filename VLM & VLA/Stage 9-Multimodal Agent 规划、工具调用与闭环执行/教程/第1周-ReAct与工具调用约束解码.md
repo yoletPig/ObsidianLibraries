@@ -48,6 +48,8 @@ $$
 p'(v) \propto p(v) \cdot \mathbb{1}[v \in \mathcal{A}(s)], \quad \mathcal{A}(s) = \text{语法在状态 } s \text{ 下允许的 Token 集}
 $$
 
+**这个公式在干什么**：$p(v)$ 是模型原本给每个 Token $v$ 的采样概率；$\mathbb{1}[v \in \mathcal{A}(s)]$ 是一个 0/1 开关——语法允许的 Token 乘 1 通过、不允许的乘 0 清零，重新归一化后得到 $p'$。$s$ 是语法状态机的当前状态（例如"刚生成完 `{"tool": "`，接下来只允许出现引号或枚举值的首字母"）。它与"把非法 Token 的 logits 置为 $-\infty$ 后再做 softmax"完全等价。结果拿来做什么：采样永远落在合法集内，"JSON 解析失败"从概率事件变成结构性不可能。
+
 工程要点：
 
 1. **状态机映射**：把 JSON Schema 编译为语法状态机（Outlines 用正则/CFG → FSM；vLLM `guided_json`、SGLang JSON Mode 内置同思路），每步解码查询当前状态允许的 Token 集；
@@ -106,7 +108,9 @@ class ToolRegistry:
         return "\n".join(lines)
 
     def execute(self, name, args) -> str:
-        """确定性执行: 校验 -> 超时包裹 -> 序列化 Observation (异常不逃逸)"""
+        """确定性执行: 校验 -> 执行 -> 序列化 Observation (异常不逃逸)。
+        注: 末尾的超时检查是"事后"检测——只能发现"执行完了但耗时超标";
+        真正可能永久挂死的工具需在线程/子进程中运行并强杀 (生产实现的超时闸)。"""
         if name not in self.tools:
             return f"ERROR: unknown tool {name}"
         tool = self.tools[name]
@@ -230,7 +234,10 @@ if __name__ == "__main__":
 运行方式: python stage9_week1_constrained.py   (在线需 vLLM 服务; 离线用 FSM 桩验证机制)
 """
 def vllm_constrained_call(api_base, model, prompt, schema):
-    """路径A: vLLM guided_json (服务端 FSM)"""
+    """路径A: vLLM guided_json (服务端 FSM)。
+    注: vLLM 新版本 (>=0.9) 推荐改用统一参数
+        extra_body={"structured_outputs": {"json": schema}},
+        guided_json 仍被接受但属废弃别名——以所装版本文档为准。"""
     from openai import OpenAI
     client = OpenAI(base_url=api_base, api_key="EMPTY")
     rsp = client.chat.completions.create(
@@ -239,7 +246,8 @@ def vllm_constrained_call(api_base, model, prompt, schema):
     return rsp.choices[0].message.content
 
 def outlines_constrained_call(model, prompt, schema):
-    """路径B: Outlines (客户端 FSM, 支持本地 HF 模型)"""
+    """路径B: Outlines (客户端 FSM, 支持本地 HF 模型)。
+    注: Outlines 新旧版本 API 差异较大 (generate.json 为旧版写法), 以所装版本文档为准。"""
     import outlines
     gen = outlines.generate.json(model, schema)      # Schema -> FSM -> 屏蔽采样
     return gen(prompt)

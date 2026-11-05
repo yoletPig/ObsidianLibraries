@@ -36,12 +36,12 @@
 
 ### 1.3 Self-Instruct：自举的飞轮
 
-Self-Instruct（*Self-Instruct: Aligning Language Models with Self-Generated Instructions*）的核心机制：**用 LLM 生成指令 → 用 LLM 处理这些指令得到回答 → 用这些数据微调 LLM**。它的两个关键工程设计值得继承：
+Self-Instruct（*Self-Instruct: Aligning Language Models with Self-Generated Instructions*，Wang et al., arXiv:2212.10560）的核心机制：**用 LLM 生成指令 → 用 LLM 处理这些指令得到回答 → 用这些数据微调 LLM**。它的两个关键工程设计值得继承：
 
-1. **种子任务 + 采样温度**：从 175 个人工种子任务出发，每轮从"已有任务池"采样几个作为 few-shot 上下文，让模型生成新任务。多样性来自采样的随机组合 + 温度。
-2. **去重与过滤前置**：生成的新指令与任务池做相似度过滤（ROUGE-L 阈值），只保留新颖指令入池——**飞轮不腐化的前提是每轮都过滤**。这个"生成→过滤→入池→再生成"的循环结构，就是本周 MVP 脚本的骨架。
+1. **种子任务 + 采样温度**：从 175 个人工种子任务出发，每轮从"已有任务池"采样几个作为 few-shot 上下文，让模型生成新任务。多样性来自采样的随机组合 + 温度。Alpaca（52K 指令、text-davinci-003 生成、成本 <$500）正是用同款流程放大的——种子集同为 175 条，证明这个飞轮的杠杆率。
+2. **去重与过滤前置**：生成的新指令与任务池做相似度过滤（论文用 ROUGE-L，超过 0.7 视为重复丢弃），只保留新颖指令入池——**飞轮不腐化的前提是每轮都过滤**。这个"生成→过滤→入池→再生成"的循环结构，就是本周 MVP 脚本的骨架。
 
-Evol-Instruct（WizardLM 系）把它升级为**显式的演化算子**——不再依赖采样的被动多样性，而是主动对已有指令施加变换。
+Evol-Instruct（*WizardLM: Empowering Large Pre-Trained Language Models to Follow Complex Instructions*，Xu et al., arXiv:2304.12244）把它升级为**显式的演化算子**——不再依赖采样的被动多样性，而是主动对已有指令施加变换。论文中的操作分组：**In-depth Evolution**（加约束、深化、具体化、增加推理步、复杂化输入等，把指令变难）与 **In-breadth Evolution**（换主题、引入新知识、变问题类型等，扩展覆盖面），并配有淘汰步（过滤重复/过难/不可回答的指令）。下面两张操作表就是这套算子在多模态场景的操作化。
 
 ### 1.4 Depth 与 Breadth 演化算子
 
@@ -73,7 +73,7 @@ Evol-Instruct（WizardLM 系）把它升级为**显式的演化算子**——不
 
 **机制**：对已有图片，用强教师 VLM 重新生成**密集描述**（Dense Captioning / Detailed Region Description），替代原数据集里短而粗糙的 caption。
 
-ShareGPT4V（*Improving Large Multi-Modal Models with Better Captions*）验证了这条路线的杠杆效应：用 GPT-4V 对已有图文对（CC3M/COCO 等）重写高质量长 caption（平均长度大幅超过原 caption），仅用这些"图片不变、描述升级"的数据预训练，下游多个 benchmark 显著提升——**同一张图片的监督信号质量，可以差出一个模型代际**。原因是 Stage 2 讲过的对齐机制：密集 caption 给 Projector 提供了更细粒度的视觉-语言对齐目标。
+ShareGPT4V（*Improving Large Multi-Modal Models with Better Captions*，arXiv:2311.12793）验证了这条路线的杠杆效应：先用 GPT-4V 对来自 COCO/LAION/CC/SBU/SAM 等来源的 10 万张图生成高质量长 caption（用于 SFT），再用这些 caption 训练出的 ShareCaptioner 模型把规模放大到 120 万条（用于预训练），下游多个 benchmark 显著提升——**同一张图片的监督信号质量，可以差出一个模型代际**。原因是 Stage 2 讲过的对齐机制：密集 caption 给 Projector 提供了更细粒度的视觉-语言对齐目标。
 
 **适用**：提升模型的基础感知与描述能力（对齐阶段收益最大）。
 **成本结构**：每张图一次教师 VLM 调用（长输出，token 贵）。
@@ -153,8 +153,10 @@ def call_teacher(api_base: str, model: str, image_path: str, op: str, seed_desc:
 def _extract_json(text: str) -> str:
     """从可能带 markdown 围栏的输出中抠出 JSON"""
     t = text.strip()
-    if "```" in t:
-        t = t.split("```")[1].lstrip("json").strip()
+    if t.startswith("`"):                    # 剥掉围栏 (判断单字符, 避免在代码块里写三反引号)
+        t = t.strip("`")
+        if t.startswith("json"):
+            t = t[4:]
     return t[t.index("{"): t.rindex("}") + 1]
 
 
@@ -162,8 +164,10 @@ def demo_teacher(image_id: str, op: str, mode: str, rng) -> dict:
     """离线伪教师: 确定性输出, 用于流程验证"""
     h = hashlib.md5(f"{image_id}{op}".encode()).hexdigest()
     kind = "depth" if op in DEPTH_OPS else "breadth"
+    # 注意 answer 必须 ≥ 30 字符, 否则会被下面 validate 的 too_short 闸门全量拦截
     return {"question": f"[{mode}-{kind}-{h[:6]}] 基于图片: {op[:18]}...",
-            "answer": f"观察…推断…结论 (伪教师输出 {h[:8]})", "evolution": kind}
+            "answer": (f"观察：图中存在主体{h[:4]}。推断：空间布局指向{h[4:8]}类场景。"
+                       "结论：按演化要求给出结论。"), "evolution": kind}
 
 
 def validate(rec: dict, seen_hashes: set) -> tuple[bool, str]:
@@ -194,7 +198,9 @@ def main():
     image_ids = [f"img_{i:03d}.jpg" for i in range(30)]     # 30 张种子图
     seen, kept, rejected = set(), [], {}
     for img in image_ids:
-        ops = (DEPTH_OPS + BREADTH_OPS) * 2
+        # 算子池先去重再采样: 直接对 (D+B)*2 采样会抽到同一算子的两个副本,
+        # 同一张图产出重复问题, 全部被 dup 闸门拦截 (实测少收 ~30 条)
+        ops = list(dict.fromkeys((DEPTH_OPS + BREADTH_OPS) * 2))
         rng.shuffle(ops)
         for op in ops[: args.ops_per_image]:                # 30 图 × 5 算子 = 150 条
             rec = (call_teacher(args.api_base, args.model, f"{args.images}/{img}",
@@ -222,10 +228,10 @@ if __name__ == "__main__":
     main()
 ```
 
-**预期输出**：
+**预期输出**（离线 demo，seed=0 实测）：
 
 ```text
-产出 150 条 -> synth.jsonl (depth 90 / breadth 60), 过滤明细: {'dup': 0, 'too_short': 0}
+产出 150 条 -> synth.jsonl (depth 79 / breadth 71), 过滤明细: {}
 ```
 
 设计要点：`validate` 是 Self-Instruct 飞轮的"前置过滤"——**任何未过闸门的样本不允许入池**（学习计划只要求 150 条产出，但过滤闸门是这套方法论的灵魂，不能省）；断言验证双算子都有产出（防止 prompt 写歪导致只跑了 depth）。真实模式接入时，把 `--api-base` 指向 vLLM 起的服务即可（第 5-6 周会讲高并发化）。

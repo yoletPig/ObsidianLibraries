@@ -67,9 +67,10 @@ DR 的失败模式恰好是"过犹不及"：随机化范围超过真实分布太
 ```python
 # 加速配置的验收断言骨架
 def assert_speed_ok(base_sr, fast_sr, base_lat, fast_lat, sr_noise=0.05, need_hz=10):
+    """fast_lat 为单步端到端延迟 (秒); 有效控制频率 = 1/延迟"""
     assert fast_sr >= base_sr - sr_noise, f"加速导致 SR 崩了: {base_sr:.0%}->{fast_sr:.0%}"
-    eff_hz = 1000 / (fast_lat * 1000)                    # 1000ms / 单步延迟
-    assert 1000 / (fast_lat * 1000) >= need_hz, f"有效频率 {eff_hz:.1f}Hz < {need_hz}Hz"
+    eff_hz = 1.0 / fast_lat
+    assert eff_hz >= need_hz, f"有效频率 {eff_hz:.1f}Hz < {need_hz}Hz"
     print(f"✅ 加速验收: SR 保持 ({fast_sr:.0%}), 有效控制频率 {eff_hz:.1f}Hz ≥ {need_hz}Hz")
 ```
 

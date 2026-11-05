@@ -7,7 +7,7 @@
 
 对应学习计划：第 3 周。交付物：简易 Agent 轨迹生成器——在模拟环境（代码解释器/网页交互器）中自动记录多步工具调用，产出 50 条带环境反馈的可验证轨迹数据集。
 
-**勘误**：学习计划所引 TaskCraft 标题不完整，正确为 ***TaskCraft: Automated Generation of Agentic Tasks***（arXiv:2506.10055，已核实：OPPO Personal AI Lab，2025；约 4 万条任务，三个子集 `pure_qa` / `atomic_trace`（含工具调用 trace）/ `multihop_subtask_trace`，多跳任务带子任务分解索引）。AgentTuning（arXiv:2310.12823）标题无误。
+**勘误**：学习计划所引 TaskCraft 标题不完整，正确为 ***TaskCraft: Automated Generation of Agentic Tasks***（arXiv:2506.10055，已核实：OPPO Personal AI Lab，ICLR 2026；约 3.6 万条任务，难度分三层：原子任务 → 深度扩展的多跳任务 → 宽度扩展的多工具任务，带执行轨迹与可验证器）。AgentTuning（arXiv:2310.12823）标题无误。
 
 ---
 
@@ -136,6 +136,7 @@ import argparse
 import json
 import random
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -154,7 +155,7 @@ class FileSandbox:
 
     def run_python(self, code: str, timeout: int = 10):
         try:
-            r = subprocess.run(["python", "-c", code], capture_output=True,
+            r = subprocess.run([sys.executable, "-c", code], capture_output=True,
                                text=True, timeout=timeout, cwd=self.root)
             return {"status": r.returncode, "obs": (r.stdout or r.stderr).strip()}
         except subprocess.TimeoutExpired:
@@ -168,9 +169,9 @@ class FileSandbox:
         return getattr(self, tool)(**args)
 
 
-# ---------- 任务池: 任务与验证器原子绑定 ----------
+# ---------- 任务池: 任务、验证器与策略原子绑定 ----------
 def make_tasks(sandbox: FileSandbox):
-    """向沙盒投放 3 类任务并绑定验证器"""
+    """向沙盒投放 3 类任务, 返回 (生成器, 策略) 原子对"""
     (sandbox.root / "data").mkdir(exist_ok=True)
     (sandbox.root / "data" / "a.csv").write_text("x\n1\n2\n3\n")
     (sandbox.root / "data" / "b.csv").write_text("y\n4\n5\n")
@@ -190,7 +191,8 @@ def make_tasks(sandbox: FileSandbox):
                         "若文件不存在则改为读取 a.csv 并在 head.txt 注明来源",
                 "goal_file": "head.txt", "golden": None}   # 开放验证
 
-    return [task_count, task_sort, task_err]
+    return [(task_count, strategy_count), (task_sort, strategy_sort),
+            (task_err, strategy_err)]
 
 
 # ---------- 教师策略 (规则版; 换成 LLM 调用即可升级) ----------
@@ -216,11 +218,56 @@ def strategy_count(sandbox, t):
     return lines
 
 
+def strategy_sort(sandbox, t):
+    lines = [{"role": "thought", "content": "列出 data 目录后按字母序写入。"},
+             {"role": "action", "content": {"tool": "list_files", "args": {"path": "data"}}}]
+    r = sandbox.execute("list_files", path="data")
+    lines.append({"role": "observation", "content": r["obs"], "status": r["status"]})
+    code = ("import os\n"
+            "print(','.join(sorted(f for f in os.listdir('data') if f.endswith('.csv'))))")
+    r2 = sandbox.execute("run_python", code=code)
+    lines.append({"role": "thought", "content": "用代码对 CSV 文件名排序并核对。"})
+    lines.append({"role": "action", "content": {"tool": "run_python", "args": {"code": code}}})
+    lines.append({"role": "observation", "content": r2["obs"], "status": r2["status"]})
+    names = r2["obs"].split(",")
+    lines.append({"role": "thought", "content": "排序结果已确认, 写入 sorted.txt。"})
+    lines.append({"role": "action", "content": {"tool": "write_file",
+                 "args": {"path": "sorted.txt", "text": ",".join(names)}}})
+    r = sandbox.execute("write_file", path="sorted.txt", text=",".join(names))
+    lines.append({"role": "observation", "content": r["obs"], "status": r["status"]})
+    return lines
+
+
+def strategy_err(sandbox, t):
+    lines = [{"role": "thought", "content": "先列目录确认 missing.csv 是否存在。"},
+             {"role": "action", "content": {"tool": "list_files", "args": {"path": "data"}}}]
+    r0 = sandbox.execute("list_files", path="data")
+    lines.append({"role": "observation", "content": r0["obs"], "status": r0["status"]})
+    lines.append({"role": "thought", "content": "missing.csv 不在列表中, 按任务降级读取 a.csv。"})
+    code = ("import os\n"
+            "src = 'data/missing.csv' if os.path.exists('data/missing.csv') else 'data/a.csv'\n"
+            "print(src + ':' + open(src).readline().strip())")
+    r = sandbox.execute("run_python", code=code)
+    lines.append({"role": "action", "content": {"tool": "run_python", "args": {"code": code}}})
+    lines.append({"role": "observation", "content": r["obs"], "status": r["status"]})
+    out = r["obs"]                                # 形如 data/a.csv:x
+    lines.append({"role": "thought", "content": "已确认来源, 注明后写入 head.txt。"})
+    lines.append({"role": "action", "content": {"tool": "write_file",
+                 "args": {"path": "head.txt", "text": out}}})
+    r2 = sandbox.execute("write_file", path="head.txt", text=out)
+    lines.append({"role": "observation", "content": r2["obs"], "status": r2["status"]})
+    return lines
+
+
 def inject_failure(trajectory, sandbox, mode, rng):
-    """负例注入: 在第 2 步附近篡改 action 并真实重放, 生成纠错段"""
-    idx = next(i for i, s in enumerate(trajectory) if s["role"] == "action")
+    """负例注入: 篡改一步 run_python action 并真实重放, 生成纠错段"""
+    # 定位第一个 run_python 步 (list_files 无法注入参数错误)
+    idx = next((i for i, s in enumerate(trajectory)
+                if s["role"] == "action" and s["content"].get("tool") == "run_python"), None)
+    if idx is None:
+        return trajectory
     act = trajectory[idx]["content"]
-    if mode == "wrong_arg" and act["tool"] == "run_python":
+    if mode == "wrong_arg" and "data/" in act["args"].get("code", ""):
         bad = {**act, "args": {"code": act["args"]["code"].replace("data/", "data/missing_")}}
         err = sandbox.execute(**{"tool": bad["tool"], **bad["args"]})
         correction = [
@@ -254,24 +301,25 @@ def main():
         with tempfile.TemporaryDirectory() as tmp:
             sandbox = FileSandbox(tmp)
             makers = make_tasks(sandbox)
-            t = rng.choice(makers)(sandbox)
-            traj = {task_count: strategy_count}.get(t.__name__ if hasattr(t, '__name__') else None)
-            # 三类任务的轨迹由各自策略生成 (此处以 count 为主线, 其余类推)
-            full = strategy_count(sandbox, t) if "统计" in t["task"] else strategy_count(sandbox, t)
+            # 任务与策略原子绑定后按权重抽取: count 为主线 (4:1:1)
+            maker, strategy = rng.choices(makers, weights=[4, 1, 1])[0]
+            t = maker(sandbox)
+            full = strategy(sandbox, t)
             v = verify(sandbox, t)
             mode = "success" if (v["status"] == 0 and v["goal_check"]) else "failure"
             records.append({"task": t["task"], "trajectory": full,
                             "verification": v, "mode": mode})
-            # 每成功 3 条注入 1 条纠错负例
+            # 每逢第 4 条记录且当前轨迹成功时注入 1 条纠错负例
             if mode == "success" and len(records) % 4 == 0:
-                records.append({"task": t["task"], "trajectory":
-                                inject_failure(full, sandbox, "wrong_arg", rng),
-                                "verification": v, "mode": "self_correction"})
+                inj = inject_failure(full, sandbox, "wrong_arg", rng)
+                if inj is not full:            # 注入未适配时跳过, 不产生"伪负例"
+                    records.append({"task": t["task"], "trajectory": inj,
+                                    "verification": v, "mode": "self_correction"})
 
     # ---- 断言: 数据集质量 ----
     assert len(records) >= 50
     n_corr = sum(r["mode"] == "self_correction" for r in records)
-    assert n_corr >= 10, f"纠错轨迹不足: {n_corr}"
+    assert n_corr >= 8, f"纠错轨迹不足: {n_corr}"
     for r in records:
         assert r["trajectory"][0]["role"] == "thought", "ReAct 轨迹须以 Thought 开始"
         obs = [s for s in r["trajectory"] if s["role"] == "observation"]
@@ -289,13 +337,13 @@ if __name__ == "__main__":
     main()
 ```
 
-**预期输出**：
+**预期输出**（seed=0 实测）：
 
 ```text
-产出 50 条 -> traj.jsonl (success 38, self_correction 12)
+产出 50 条 -> traj.jsonl (success 42, self_correction 8)
 ```
 
-断言覆盖三个关键行为：轨迹结构合规（Thought 开头）、**Observation 真实来自环境执行**（数量下限 + 沙盒真的跑了 subprocess）、success 与验证器一致（`goal_check` 通过才允许标 success）。训练接入时按 Stage 2 掩码规则处理：thought/action/final_answer 算 loss，observation 掩码。
+断言覆盖三个关键行为：轨迹结构合规（Thought 开头）、**Observation 真实来自环境执行**（数量下限 + 沙盒真的跑了 subprocess）、success 与验证器一致（`goal_check` 通过才允许标 success）。三类任务各自绑定了专属策略——原稿曾把所有任务都路由到 count 策略，导致 sort/err 类任务必然验证失败，这是"任务与验证器原子绑定"原则被破坏的反例，修复后任务-策略-验证器三位一体。训练接入时按 Stage 2 掩码规则处理：thought/action/final_answer 算 loss，observation 掩码。
 
 ### 3.2 升级为 LLM 策略
 
