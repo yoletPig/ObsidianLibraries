@@ -16,6 +16,19 @@
 
 **选题标准**（后续批次沿用）：① 近三年（可放宽到 2023）；② 有可清晰陈述的**核心创新**（一句话能说清"之前不行→现在行"）；③ 有**官方开源仓库**（代码或权重，能在本地跑通推理者优先）；④ 与本知识库至少一个方向强衔接。
 
+## 第 2 批（07-12）：深化与对照
+
+第 2 批的三条主线：**深化**（07 篇把 01 篇的 MLA 讲透）、**加速补全**（06 篇是系统级，12 篇补算子级，算法级投机解码留给后续批次）、**同领域路线对照**（09/10/11 篇分别与 03/04/05 篇同领域对照，报告内含对照表）。
+
+| 篇 | 领域 | 论文 | 年份 | 核心创新 | 开源仓库 | 对照/衔接 |
+| --- | --- | --- | --- | --- | --- | --- |
+| [07](07-DeepSeek-V2-MLA/解读报告.md) | 大模型架构 | DeepSeek-V2: A Strong, Economical, and Efficient MoE Language Model (arXiv 2405.04434) | 2024-05 | **MLA 首创**（低秩 KV 联合压缩+解耦 RoPE 键）、细粒度 MoE + 共享专家、device-limited routing | [deepseek-ai/DeepSeek-V2](https://github.com/deepseek-ai/DeepSeek-V2) | 深化 01 篇：MLA 数学细节与消融在 V2 原文 |
+| [08](08-Kimi-K2/解读报告.md) | 大模型·Agent | Kimi K2: Open Agentic Intelligence (arXiv 2507.20534) | 2025-07 | MuonClip 优化器（Muon + QK-Clip 抑制 logit 爆炸）、1T/32B 激活 MoE、15.5T tokens agent 数据管线 | [MoonshotAI/Kimi-K2](https://github.com/MoonshotAI/Kimi-K2) | 与 01 篇对照：MoE 路线异同；衔接 Agent 开发系列 |
+| [09](09-Moshi/解读报告.md) | 端到端语音 | Moshi: a speech-text foundation model for real-time dialogue (arXiv 2410.00037) | 2024-09 | 全双工对话（并行双流 audio-text）、Mimi 神经编解码（12.5Hz/1.1kbps）、RQ-Transformer、inner monologue | [kyutai-labs/moshi](https://github.com/kyutai-labs/moshi) | 与 03 篇对照：全双工 vs 轮次制两条端到端语音路线 |
+| [10](10-V-JEPA-2/解读报告.md) | 世界模型 | V-JEPA 2: Self-Supervised Video Models Enable Understanding, Prediction and Planning (arXiv 2506.09985) | 2025-06 | 潜空间预测世界模型（非像素生成，最大 1B/ViT-g）、action-conditioned V-JEPA 2-AC（62h Droid）、零样本机器人规划 | [facebookresearch/vjepa2](https://github.com/facebookresearch/vjepa2) | 与 04 篇对照：JEPA 潜空间路线 vs Cosmos 像素生成路线 |
+| [11](11-QuaRot/解读报告.md) | 量化 | QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs (arXiv 2404.00456, NeurIPS 2024) | 2024-04 | 计算不变性（Hadamard 旋转不改变模型输出）+ "切掉"离群值、四类旋转插入点（模型级/RMSNorm 融合/在线激活/KV，SpinQuant 记为 R1-R4）、权重/激活/KV 全 4bit 端到端前向 | [spcl/QuaRot](https://github.com/spcl/QuaRot) | 与 05 篇对照：PTQ 主流前沿 vs BitNet 范式挑战 |
+| [12](12-FlashAttention-3/解读报告.md) | 加速·算子 | FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision (arXiv 2407.08608) | 2024-07 | Hopper 异步 warp 专业化（TMA + wgmma）、softmax 重叠计算、FP8 块级缩放 + 非相干处理 | [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention) | 加速三层次之算子级（系统级=06 vLLM）；衔接模型性能优化 Stage 3 |
+
 ## 解读报告统一模板
 
 1. **论文档案**：标题 / 作者与机构 / 发表处 / arXiv / 开源仓库与许可证 / 模型权重可得性
